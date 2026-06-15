@@ -10,7 +10,9 @@ from config import (
     TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
-    TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
+    TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG,
+    VOLUME_RANK_LOG, VOLUME_RANK_TTL_HOURS,
+    SUPERTREND_PERIOD, SUPERTREND_MULT,
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_PERIOD, EMA_BAND_PCT,
@@ -46,7 +48,10 @@ def save_json(filepath, data):
 
 def init_files():
     os.makedirs("data", exist_ok=True)
-    for filepath, default in [(TRADE_LOG, []), (EQUITY_LOG, []), (TRAILING_STOP_LOG, {}), (LOC_LOG, {})]:
+    for filepath, default in [
+        (TRADE_LOG, []), (EQUITY_LOG, []), (TRAILING_STOP_LOG, {}),
+        (LOC_LOG, {}), (VOLUME_RANK_LOG, {}),
+    ]:
         try:
             with open(filepath, "r") as f:
                 json.load(f)
@@ -63,59 +68,95 @@ def sleep_until_next_hour():
 
 # ─── Dynamic Symbol Selection ─────────────────────────────────────────────────
 
+def build_volume_ranking():
+    """
+    Fetch 30-day daily candles for all testnet-tradeable non-stablecoin symbols
+    and compute average daily dollar volume (v × close). Pre-filters to top-50
+    by 24h vol to bound the number of API calls. Results cached in VOLUME_RANK_LOG.
+    Returns [[symbol, avg_vol_usd], ...] sorted descending.
+    """
+    logger.info("Building 30-day avg volume ranking (runs once per day)...")
+    end_ms   = int(time.time() * 1000)
+    start_ms = end_ms - 30 * 24 * 60 * 60 * 1000
+
+    meta_ctxs     = mainnet_info.meta_and_asset_ctxs()
+    universe      = meta_ctxs[0]['universe']
+    ctxs          = meta_ctxs[1]
+    testnet_coins = get_testnet_coins()
+
+    # Candidate pool: testnet-tradeable non-stablecoins, pre-sorted by 24h vol
+    candidates = []
+    for i, asset in enumerate(universe):
+        name = asset['name']
+        if name.upper() in STABLECOINS or i >= len(ctxs):
+            continue
+        if testnet_coins and name not in testnet_coins:
+            continue
+        candidates.append((name, float(ctxs[i].get('dayNtlVlm', 0))))
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    candidates = candidates[:50]
+
+    def fetch_30d(sym):
+        try:
+            candles = mainnet_info.candles_snapshot(sym, "1d", start_ms, end_ms)
+            if not candles:
+                return sym, 0.0
+            avg = sum(float(c['v']) * float(c['c']) for c in candles) / len(candles)
+            return sym, avg
+        except Exception as e:
+            logger.warning(f"Volume rank: {sym} failed — {e}")
+            return sym, 0.0
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_30d, sym): sym for sym, _ in candidates}
+        results = [f.result() for f in as_completed(futures)]
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    ranking = [[sym, vol] for sym, vol in results]
+    save_json(VOLUME_RANK_LOG, {"computed_at": datetime.now().isoformat(), "ranking": ranking})
+    logger.info(f"30-day ranking built. Top 10: {[r[0] for r in ranking[:10]]}")
+    return ranking
+
+
 def get_top_symbols(top_n=TOP_N, extra_symbols=None):
     extra_symbols = extra_symbols or []
     try:
-        meta_and_ctxs = mainnet_info.meta_and_asset_ctxs()
-        universe = meta_and_ctxs[0]['universe']
-        ctxs = meta_and_ctxs[1]
+        # Load cached ranking or rebuild if missing / stale
+        cached  = load_json(VOLUME_RANK_LOG, {})
+        ranking = None
+        if cached.get('computed_at') and cached.get('ranking'):
+            age_h = (datetime.now() - datetime.fromisoformat(cached['computed_at'])).total_seconds() / 3600
+            if age_h < VOLUME_RANK_TTL_HOURS:
+                ranking = cached['ranking']
 
-        markets = []
-        for i, asset in enumerate(universe):
-            if i >= len(ctxs):
-                continue
-            name = asset['name']
-            if name.upper() in STABLECOINS:
-                continue
-            ctx = ctxs[i]
-            day_volume = float(ctx.get('dayNtlVlm', 0))
-            markets.append((name, day_volume))
+        if ranking is None:
+            ranking = build_volume_ranking()
 
-        markets.sort(key=lambda x: x[1], reverse=True)
+        top = [sym for sym, _ in ranking[:top_n]]
 
         testnet_coins = get_testnet_coins()
-        if testnet_coins:
-            tradeable = [(n, v) for n, v in markets if n in testnet_coins]
-            skipped = [n for n, v in markets[:top_n] if n not in testnet_coins]
-            if skipped:
-                logger.info(f"  Skipping (not on testnet): {', '.join(skipped)}")
-            markets = tradeable
-
-        top = [name for name, vol in markets[:top_n]]
-
         for sym in PINNED:
             if sym not in top:
                 if testnet_coins and sym not in testnet_coins:
                     logger.info(f"  Pin {sym} not on testnet — skipping")
                     continue
                 top.append(sym)
-                logger.info(f"  Pinning {sym} (always included)")
+                logger.info(f"  Pinning {sym} (not in top {top_n})")
 
         for sym in extra_symbols:
             if sym not in top:
                 top.append(sym)
-                logger.info(f"  Keeping {sym} (open position, outside top {top_n})")
+                logger.info(f"  Keeping {sym} (open position)")
 
-        logger.info(f"Top {top_n} testnet-tradeable perps by 24h dollar volume (stablecoins excluded):")
-        for rank, (name, vol) in enumerate(markets[:top_n], 1):
-            pin_tag = " [PINNED]" if name in PINNED else ""
-            logger.info(f"  #{rank} {name}: ${vol:,.0f}{pin_tag}")
+        logger.info(f"Top {top_n} testnet perps by 30-day avg $ volume:")
+        for rank, (sym, vol) in enumerate(ranking[:top_n], 1):
+            pin_tag = " [PINNED]" if sym in PINNED else ""
+            logger.info(f"  #{rank} {sym}: ${vol:,.0f}/day{pin_tag}")
 
         return top
     except Exception as e:
         logger.error(f"Failed to rank symbols: {e}")
-        fallback = ["BTC", "ETH", "SOL", "HYPE"]
-        return list(set(fallback + extra_symbols))
+        return list(set(["BTC", "ETH", "SOL", "HYPE"] + extra_symbols))
 
 # ─── Market Data ──────────────────────────────────────────────────────────────
 

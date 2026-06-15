@@ -42,10 +42,12 @@ RSI_LOOKBACK = 5          # bars to look back for a dip/spike
 EMA_PERIOD = 20
 EMA_BAND_PCT = 0.02       # price within ±2% of EMA counts as "near"
 
-TRADE_LOG         = "data/trades.json"
-EQUITY_LOG        = "data/equity_curve.json"
-TRAILING_STOP_LOG = "data/trailing_peaks.json"
-LOC_LOG           = "data/pending_loc.json"
+TRADE_LOG             = "data/trades.json"
+EQUITY_LOG            = "data/equity_curve.json"
+TRAILING_STOP_LOG     = "data/trailing_peaks.json"
+LOC_LOG               = "data/pending_loc.json"
+VOLUME_RANK_LOG       = "data/volume_ranking.json"
+VOLUME_RANK_TTL_HOURS = 24
 
 FUNDING_LONG_MAX     = 0.05    # % — skip long if funding above this
 FUNDING_SHORT_MIN    = -0.05   # % — skip short if funding below this
