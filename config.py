@@ -35,5 +35,6 @@ RSI_LOOKBACK = 5          # bars to look back for a dip/spike
 EMA_PERIOD = 20
 EMA_BAND_PCT = 0.02       # price within ±2% of EMA counts as "near"
 
-TRADE_LOG = "data/trades.json"
-EQUITY_LOG = "data/equity_curve.json"
+TRADE_LOG         = "data/trades.json"
+EQUITY_LOG        = "data/equity_curve.json"
+TRAILING_STOP_LOG = "data/trailing_peaks.json"

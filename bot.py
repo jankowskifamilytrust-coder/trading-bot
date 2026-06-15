@@ -10,7 +10,7 @@ from config import (
     TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
     VOL_TARGET_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
-    TRADE_LOG, EQUITY_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
+    TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_PERIOD, EMA_BAND_PCT,
@@ -44,7 +44,7 @@ def save_json(filepath, data):
 
 def init_files():
     os.makedirs("data", exist_ok=True)
-    for filepath, default in [(TRADE_LOG, []), (EQUITY_LOG, [])]:
+    for filepath, default in [(TRADE_LOG, []), (EQUITY_LOG, []), (TRAILING_STOP_LOG, {})]:
         try:
             with open(filepath, "r") as f:
                 json.load(f)
@@ -320,6 +320,8 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
     fill_sz = abs(pos['size']) if pos else 0
     logger.success(f"✅ OPEN {direction} {symbol}: {fill_sz} @ ${fill_px:.4f} (MAKER) | "
                    f"Notional: ${notional_usd:.2f} | Confluence: {confluence}")
+    if fill_px:
+        init_peak(symbol, fill_px)
     action_label = "BUY" if is_buy else "SELL"
     log_trade(action_label, symbol, fill_sz, fill_px, reason, equity,
               cvd_signal, obi_signal, oi_signal, confluence)
@@ -357,6 +359,7 @@ def close_position_market(symbol, all_data, equity, reason,
                 fill_px = float(s['filled'].get('avgPx', exec_price))
         if filled or symbol not in get_open_positions():
             logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (taker)")
+            clear_peak(symbol)
             log_trade("CLOSE", symbol, 0, fill_px, reason, equity,
                       cvd_signal, obi_signal, oi_signal, confluence)
             send_telegram(f"🔴 <b>CLOSE</b> (market)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
@@ -371,6 +374,7 @@ def close_position_market(symbol, all_data, equity, reason,
 
 def _log_maker_close(symbol, fill_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence):
     logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (MAKER)")
+    clear_peak(symbol)
     log_trade("CLOSE", symbol, 0, fill_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
     send_telegram(f"🔴 <b>CLOSE</b> (maker)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
 
@@ -408,42 +412,104 @@ def close_position_maker(symbol, all_data, equity, reason,
     return close_position_market(symbol, all_data, equity, f"{reason} (market fallback)",
                                  cvd_signal, obi_signal, oi_signal, confluence)
 
-# ─── ATR Stop-Loss ────────────────────────────────────────────────────────────
+# ─── Chandelier (Trailing ATR) Stop ──────────────────────────────────────────
+
+def _load_peaks():
+    return load_json(TRAILING_STOP_LOG, {})
+
+def _save_peaks(peaks):
+    save_json(TRAILING_STOP_LOG, peaks)
+
+def init_peak(symbol, entry_price):
+    """Called on position open — seed the peak at fill price."""
+    peaks = _load_peaks()
+    peaks[symbol] = entry_price
+    _save_peaks(peaks)
+    logger.info(f"Chandelier {symbol}: peak initialised at ${entry_price:.4f}")
+
+def clear_peak(symbol):
+    peaks = _load_peaks()
+    if symbol in peaks:
+        del peaks[symbol]
+        _save_peaks(peaks)
+
 
 def check_stops(positions, all_data, equity):
+    """
+    Chandelier (trailing ATR) stop — the stop ratchets with price in the
+    profitable direction and never moves against the trade.
+
+    Long:  stop = max(entry, highest_price_since_entry) − STOP_ATR_MULT × ATR
+    Short: stop = min(entry, lowest_price_since_entry)  + STOP_ATR_MULT × ATR
+
+    On the first tick for a position with no stored peak (e.g. restart), the
+    peak is seeded from entry price, so the stop starts at entry − 3×ATR and
+    tightens from there.
+    """
+    peaks = _load_peaks()
+    peaks_changed = False
     closed_any = False
+
     for sym, p in list(positions.items()):
         data = all_data.get(sym)
         if not data:
             logger.warning(f"Stop check: no market data for {sym} — skipping")
             continue
-        atr = data.get('atr')
+        atr   = data.get('atr')
         price = data.get('tn_price') or data.get('price')
-        entry = p['entry']; side = p['side']
+        entry = p['entry']
+        side  = p['side']
         if not atr or not price or not entry:
             continue
 
+        # Seed peak from entry if we've never seen this position (e.g. bot restart)
+        if sym not in peaks:
+            peaks[sym] = entry
+            peaks_changed = True
+
+        peak = peaks[sym]
         stop_distance = STOP_ATR_MULT * atr
+
         if side == "LONG":
-            stop_price = entry - stop_distance
+            new_peak = max(peak, price)
+            stop_price = new_peak - stop_distance
             breached = price <= stop_price
         else:
-            stop_price = entry + stop_distance
+            new_peak = min(peak, price)
+            stop_price = new_peak + stop_distance
             breached = price >= stop_price
+
+        # Ratchet the peak forward if price moved in our favour
+        if new_peak != peak:
+            peaks[sym] = new_peak
+            peaks_changed = True
+
+        trail_gain = abs(new_peak - entry)
+        logger.debug(
+            f"Chandelier {sym} {side}: entry=${entry:.4f} peak=${new_peak:.4f} "
+            f"(+${trail_gain:.4f}) | stop=${stop_price:.4f} | now=${price:.4f}"
+        )
 
         if breached:
             logger.warning(
-                f"🛑 STOP HIT {sym} {side}: entry ${entry:.4f}, now ${price:.4f}, "
-                f"stop ${stop_price:.4f} ({STOP_ATR_MULT}×ATR={stop_distance:.4f})"
+                f"🛑 TRAILING STOP {sym} {side}: peak ${new_peak:.4f} → "
+                f"stop ${stop_price:.4f} | now ${price:.4f}"
             )
             send_telegram(
-                f"🛑 <b>STOP-LOSS {sym} {side}</b>\n"
-                f"Entry: ${entry:.4f} → Now: ${price:.4f}\n"
-                f"Stop: ${stop_price:.4f} ({STOP_ATR_MULT}×ATR) — market close"
+                f"🛑 <b>TRAILING STOP {sym} {side}</b>\n"
+                f"Entry: ${entry:.4f} | Peak: ${new_peak:.4f}\n"
+                f"Trail stop: ${stop_price:.4f} ({STOP_ATR_MULT}×ATR=${stop_distance:.4f})\n"
+                f"Now: ${price:.4f} — market close"
             )
-            if close_position_market(sym, all_data, equity, f"ATR stop ({STOP_ATR_MULT}×ATR) breached"):
+            if close_position_market(sym, all_data, equity,
+                                     f"Chandelier stop ({STOP_ATR_MULT}×ATR from peak ${new_peak:.4f})"):
+                clear_peak(sym)
+                peaks.pop(sym, None)
                 closed_any = True
                 time.sleep(1)
+
+    if peaks_changed:
+        _save_peaks(peaks)
     return closed_any
 
 # ─── Claude Decision ──────────────────────────────────────────────────────────
