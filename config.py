@@ -20,7 +20,8 @@ SETTLE_SECONDS = 3
 MAX_ORACLE_GAP_PCT = 3.0
 MAKER_WAIT_SECONDS = 30
 
-VOL_TARGET_PCT = 0.02
+RISK_PER_TRADE_PCT   = 0.01   # fraction of equity risked per stop-out
+MAX_PORTFOLIO_RISK_PCT = 0.03  # total open risk cap before new entries are blocked
 MAX_NOTIONAL_USD = 200
 MIN_NOTIONAL_USD = 20
 

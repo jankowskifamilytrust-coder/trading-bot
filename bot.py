@@ -9,7 +9,7 @@ from loguru import logger
 from config import (
     TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
-    VOL_TARGET_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
+    RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
     TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
@@ -260,18 +260,22 @@ def get_all_market_data(symbols, open_position_syms=None):
 # ─── Position Sizing ──────────────────────────────────────────────────────────
 
 def compute_notional(symbol, all_data, equity):
-    daily_vol = all_data[symbol].get('daily_vol')
-    if daily_vol and daily_vol > 0:
-        target_risk_usd = equity * VOL_TARGET_PCT
-        vol_notional = target_risk_usd / daily_vol
-        notional = min(vol_notional, MAX_NOTIONAL_USD)
-        notional = max(notional, MIN_NOTIONAL_USD)
+    """Size position so a stop-out costs exactly RISK_PER_TRADE_PCT of equity."""
+    atr   = all_data[symbol].get('atr')
+    price = all_data[symbol].get('tn_price') or all_data[symbol].get('price', 0)
+    if atr and price and atr > 0:
+        dollar_risk   = equity * RISK_PER_TRADE_PCT
+        stop_distance = STOP_ATR_MULT * atr
+        size_tokens   = dollar_risk / stop_distance
+        notional      = size_tokens * price
+        notional      = min(notional, MAX_NOTIONAL_USD)
+        notional      = max(notional, MIN_NOTIONAL_USD)
         logger.info(
-            f"Vol sizing {symbol}: daily_vol={daily_vol*100:.1f}% | target risk ${target_risk_usd:.2f} | "
-            f"vol notional ${vol_notional:.2f} → final ${notional:.2f}"
+            f"ATR sizing {symbol}: ATR=${atr:.4f} | stop=${stop_distance:.4f} | "
+            f"risk ${dollar_risk:.2f} → {size_tokens:.4f} tok → ${notional:.2f} notional"
         )
-        return notional, daily_vol
-    logger.warning(f"{symbol}: no vol data — using max notional ${MAX_NOTIONAL_USD:.2f}")
+        return notional, atr
+    logger.warning(f"{symbol}: no ATR data — using max notional ${MAX_NOTIONAL_USD:.2f}")
     return MAX_NOTIONAL_USD, None
 
 # ─── Entry (post-only maker) ──────────────────────────────────────────────────
@@ -283,7 +287,7 @@ def open_position(symbol, is_buy, all_data, equity,
     (one tick inside, toward mid). If neither fills, the trade is skipped.
     """
     sz_decimals = all_data[symbol].get('sz_decimals', 3)
-    notional_usd, daily_vol = compute_notional(symbol, all_data, equity)
+    notional_usd, atr_val = compute_notional(symbol, all_data, equity)
     direction = "LONG" if is_buy else "SHORT"
 
     try:
@@ -320,7 +324,7 @@ def open_position(symbol, is_buy, all_data, equity,
         sym_data = all_data.get(symbol, {})
 
         if status == 'filled':
-            return _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
+            return _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
                                   cvd_signal, oi_signal, confluence, reason, equity,
                                   sym_data=sym_data)
 
@@ -336,7 +340,7 @@ def open_position(symbol, is_buy, all_data, equity,
         logger.info(f"{symbol} resting (oid {oid}) — waiting up to {MAKER_WAIT_SECONDS}s for fill")
         filled = wait_until(symbol, want_open=True, seconds=MAKER_WAIT_SECONDS)
         if filled:
-            return _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
+            return _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
                                   cvd_signal, oi_signal, confluence, reason, equity,
                                   sym_data=sym_data)
         cancel_order(symbol, oid)
@@ -346,7 +350,7 @@ def open_position(symbol, is_buy, all_data, equity,
     send_telegram(f"⏳ <b>{symbol} {direction} skipped</b>\nMaker order didn't fill (no taker fee paid)")
     return False
 
-def _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
+def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
                    cvd_signal, oi_signal, confluence, reason, equity, sym_data=None):
     pos = get_open_positions().get(symbol)
     fill_px = pos['entry'] if pos else 0
@@ -370,13 +374,14 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
     log_trade(action_label, symbol, fill_sz, fill_px, reason, equity,
               cvd_signal, oi_signal, confluence)
     emoji = "🟢" if is_buy else "🟠"
-    vol_pct = f"{daily_vol*100:.1f}%" if daily_vol else "n/a"
+    stop_dist = f"${STOP_ATR_MULT * atr_val:.4f}" if atr_val else "n/a"
+    dollar_risk = equity * RISK_PER_TRADE_PCT if equity else 0
     send_telegram(
         f"{emoji} <b>OPEN {direction}</b> (maker)\n"
         f"Symbol: <b>{symbol}</b>\n"
         f"Fill: ${fill_px:.4f}\n"
         f"Size: {fill_sz} (${notional_usd:.0f} notional)\n"
-        f"Daily vol: {vol_pct} | Risk-targeted {VOL_TARGET_PCT*100:.0f}%\n"
+        f"Stop dist: {stop_dist} | Risk: ${dollar_risk:.2f} ({RISK_PER_TRADE_PCT*100:.0f}% equity)\n"
         f"Confluence: {confluence}\n"
         f"Reason: {reason}"
     )
@@ -867,7 +872,7 @@ def run_bot():
     logger.info(f"Pinned symbols: {', '.join(PINNED)}")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
     logger.info(f"Exits: ST flip | ADX decay <{ADX_DECAY_EXIT} | time >{MAX_HOLD_HOURS}h | chandelier {STOP_ATR_MULT}×ATR + struct stop")
-    logger.info(f"Sizing: VOL-TARGETED {VOL_TARGET_PCT*100:.0f}% daily risk, cap ${MAX_NOTIONAL_USD} notional")
+    logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional ${MIN_NOTIONAL_USD}–${MAX_NOTIONAL_USD}")
     logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +1×ATR")
     logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS} | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
     logger.info(f"Data: MAINNET | Trading: TESTNET | Interval: {INTERVAL_MINUTES}min (clock-aligned)")
@@ -902,11 +907,22 @@ def run_bot():
                     positions = get_open_positions()
                     equity    = get_equity()
 
-            # ── Step 2: Rule-based entry (only if slot available) ─────────────
+            # ── Step 2: Rule-based entry (only if slot available + heat OK) ────
             if len(positions) < MAX_POSITIONS:
                 logger.info("Scanning for entry setups...")
                 entry_sym, is_long = select_entry(all_data, positions)
                 if entry_sym:
+                    open_risk = sum(
+                        abs(p['size']) * (all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
+                        for sym, p in positions.items()
+                    )
+                    heat_pct = open_risk / equity if equity > 0 else 0
+                    logger.info(f"Portfolio heat: ${open_risk:.2f} = {heat_pct*100:.1f}% of equity")
+                    if heat_pct >= MAX_PORTFOLIO_RISK_PCT:
+                        logger.info(
+                            f"Heat {heat_pct*100:.1f}% ≥ {MAX_PORTFOLIO_RISK_PCT*100:.0f}% cap — skipping {entry_sym}"
+                        )
+                        entry_sym = None
                     data       = all_data[entry_sym]
                     cvd_signal = data.get('cvd', {}).get('cvd_trend', 'neutral')
                     oi_signal  = data.get('oi', {}).get('oi_signal', 'stable')
