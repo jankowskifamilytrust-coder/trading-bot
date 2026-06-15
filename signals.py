@@ -1,5 +1,5 @@
 from loguru import logger
-from config import ATR_PERIOD, SUPERTREND_PERIOD, SUPERTREND_MULT
+from config import ATR_PERIOD, SUPERTREND_PERIOD, SUPERTREND_MULT, ADX_PERIOD, ADX_THRESHOLD
 
 
 def compute_daily_vol(candles):
@@ -168,6 +168,67 @@ def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_
         }
     except Exception:
         return {"direction": "neutral", "value": 0.0, "changed": False}
+
+
+def compute_adx(candles, period=ADX_PERIOD):
+    """
+    Wilder's ADX on the provided candles (use daily bars).
+    Returns adx, +DI, -DI, and trending (ADX > ADX_THRESHOLD).
+    Highest ADX among eligible symbols = strongest trend = priority pick.
+    """
+    try:
+        if len(candles) < period * 2 + 1:
+            return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
+
+        n = len(candles)
+        H = [float(c['h']) for c in candles]
+        L = [float(c['l']) for c in candles]
+        C = [float(c['c']) for c in candles]
+
+        tr_vals, pdm_vals, mdm_vals = [], [], []
+        for i in range(1, n):
+            tr = max(H[i] - L[i], abs(H[i] - C[i-1]), abs(L[i] - C[i-1]))
+            up   = H[i] - H[i-1]
+            down = L[i-1] - L[i]
+            tr_vals.append(tr)
+            pdm_vals.append(up   if up > down and up > 0   else 0.0)
+            mdm_vals.append(down if down > up and down > 0 else 0.0)
+
+        def wilder(values, p):
+            """Wilder smoothing (RMA): SMA seed, then (prev*(p-1) + cur) / p."""
+            if len(values) < p:
+                return []
+            result = [sum(values[:p]) / p]
+            for v in values[p:]:
+                result.append((result[-1] * (p - 1) + v) / p)
+            return result
+
+        atr_s = wilder(tr_vals,  period)
+        pdm_s = wilder(pdm_vals, period)
+        mdm_s = wilder(mdm_vals, period)
+
+        dx_vals = []
+        for i in range(len(atr_s)):
+            if atr_s[i] == 0:
+                dx_vals.append((0.0, 0.0, 0.0))
+                continue
+            pdi = 100.0 * pdm_s[i] / atr_s[i]
+            mdi = 100.0 * mdm_s[i] / atr_s[i]
+            denom = pdi + mdi
+            dx  = 100.0 * abs(pdi - mdi) / denom if denom else 0.0
+            dx_vals.append((dx, pdi, mdi))
+
+        adx_s = wilder([d[0] for d in dx_vals], period)
+        if not adx_s:
+            return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
+
+        adx   = round(adx_s[-1], 2)
+        pdi   = round(dx_vals[-1][1], 2)
+        mdi   = round(dx_vals[-1][2], 2)
+
+        return {"adx": adx, "plus_di": pdi, "minus_di": mdi, "trending": adx > ADX_THRESHOLD}
+    except Exception:
+        return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
 
 
 def compute_oi(symbol, candles, price, info):

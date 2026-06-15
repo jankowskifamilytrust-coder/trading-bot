@@ -11,9 +11,13 @@ from config import (
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
     VOL_TARGET_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
     TRADE_LOG, EQUITY_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
+    ADX_PERIOD, ADX_THRESHOLD,
 )
 from notify import send_telegram
-from signals import compute_daily_vol, compute_atr, compute_cvd, compute_obi, compute_vpin, compute_oi, compute_supertrend
+from signals import (
+    compute_daily_vol, compute_atr, compute_cvd, compute_obi, compute_vpin,
+    compute_oi, compute_supertrend, compute_adx,
+)
 from exchange import (
     mainnet_info, exchange as hl_exchange,
     get_testnet_coins, get_testnet_price_map, get_testnet_book,
@@ -135,15 +139,17 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
             asset_info = next((a for a in meta['universe'] if a['name'] == symbol), None)
             sz_decimals = int(asset_info['szDecimals']) if asset_info else 3
 
-            # Daily candles for Supertrend (90 days → enough for ATR period 14)
+            # Daily candles — shared by Supertrend and ADX (one fetch, two indicators)
             try:
                 d_end = int(time.time() * 1000)
                 d_start = d_end - (90 * 24 * 60 * 60 * 1000)
                 daily_candles = mainnet_info.candles_snapshot(symbol, "1d", d_start, d_end)
                 supertrend = compute_supertrend(daily_candles)
+                adx = compute_adx(daily_candles)
             except Exception as e:
-                logger.warning(f"{symbol}: daily candle fetch failed — Supertrend neutral: {e}")
+                logger.warning(f"{symbol}: daily candle fetch failed — Supertrend/ADX neutral: {e}")
                 supertrend = {"direction": "neutral", "value": 0.0, "changed": False}
+                adx = {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
 
             return {
                 "symbol": symbol, "price": price,
@@ -157,6 +163,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "vpin": compute_vpin(candles),
                 "oi": compute_oi(symbol, candles, price, mainnet_info),
                 "supertrend": supertrend,
+                "adx": adx,
             }
         except Exception as e:
             if attempt < max_retries:
@@ -199,11 +206,13 @@ def get_all_market_data(symbols, open_position_syms=None):
     for sym, data in all_data.items():
         vol_str = f"{data['daily_vol']*100:.1f}%" if data['daily_vol'] else "n/a"
         st = data['supertrend']
-        st_tag = f"ST={st['direction'].upper()}" + (" [FLIP]" if st['changed'] else "")
+        adx = data['adx']
+        st_tag  = f"ST={st['direction'].upper()}" + (" [FLIP]" if st['changed'] else "")
+        adx_tag = f"ADX={adx['adx']:.1f}" + (" ✓" if adx['trending'] else " ✗chop")
         logger.info(
             f"  {sym}: testnet ${data['tn_price']:.4f} | DailyVol={vol_str} | "
             f"OI=${data['oi']['oi_usd']:,.0f} | CVD={data['cvd']['cvd_trend']} | "
-            f"OBI={data['obi']['obi']} | Funding={data['oi']['funding']}% | {st_tag}"
+            f"OBI={data['obi']['obi']} | Funding={data['oi']['funding']}% | {st_tag} | {adx_tag}"
         )
 
     if failed:
@@ -436,11 +445,14 @@ def ask_claude(all_data, equity, positions):
         pos = positions.get(symbol)
         pos_str = f"OPEN {pos['side']} {abs(pos['size'])} @ ${pos['entry']:.4f}" if pos else "no position"
         vol_str = f"{data['daily_vol']*100:.1f}%" if data.get('daily_vol') else "n/a"
-        st = data['supertrend']
-        st_flip = " ← TREND JUST FLIPPED" if st['changed'] else ""
+        st  = data['supertrend']
+        adx = data['adx']
+        st_flip  = " ← TREND JUST FLIPPED" if st['changed'] else ""
+        adx_gate = f"TRENDING — eligible (ADX {adx['adx']:.1f} > {ADX_THRESHOLD})" if adx['trending'] else f"CHOPPY — no entry (ADX {adx['adx']:.1f} ≤ {ADX_THRESHOLD})"
         market_summary += f"""
 {symbol} (${data['price']:.4f}) [{pos_str}] | 24h Vol: ${data['oi']['day_volume']:,.0f} | Daily vol: {vol_str}:
   Supertrend (daily, ATR {SUPERTREND_PERIOD}, ×{SUPERTREND_MULT}): {st['direction'].upper()} @ {st['value']:.4f}{st_flip}
+  ADX (daily, {ADX_PERIOD}): {adx['adx']:.1f} | +DI {adx['plus_di']:.1f} / -DI {adx['minus_di']:.1f} | {adx_gate}
   Candles (last 10h):
 {data['candle_summary']}
   Orderflow:
@@ -484,6 +496,10 @@ Signal interpretation guide:
     BEARISH Supertrend → only OPEN_SHORT is allowed (OPEN_LONG will be blocked).
     CLOSE and FLIP are never blocked by Supertrend.
     A Supertrend FLIP on the latest daily candle is a strong directional signal.
+- ADX (daily) measures TREND STRENGTH — it is also enforced as a HARD FILTER:
+    ADX > {ADX_THRESHOLD} = trending, entries allowed. ADX ≤ {ADX_THRESHOLD} = choppy, no new entries.
+    When multiple symbols have ADX > {ADX_THRESHOLD}, pick the one with the HIGHEST ADX — strongest trend wins.
+    +DI > -DI = bullish momentum. -DI > +DI = bearish momentum (confirms direction).
 - CVD rising = buyers in control (bullish). Falling = sellers (bearish).
 - CVD divergence: price up + CVD down = bearish reversal risk. Price down + CVD up = bullish reversal.
 - OBI >+0.3 = bullish (bid heavy), <-0.3 = bearish (ask heavy), near 0 = neutral.
@@ -581,6 +597,10 @@ def execute_decision(decision_text, all_data, equity, positions):
             return False
         if st_dir == 'bullish' and action == "OPEN_SHORT":
             logger.info(f"{symbol} OPEN_SHORT blocked — daily Supertrend is BULLISH")
+            return False
+        adx_data = all_data[symbol].get('adx', {})
+        if not adx_data.get('trending', False):
+            logger.info(f"{symbol} {action} blocked — ADX {adx_data.get('adx', 0):.1f} ≤ {ADX_THRESHOLD} (choppy, no trend)")
             return False
         return open_position(symbol, action == "OPEN_LONG", all_data, equity,
                              cvd_signal, obi_signal, oi_signal, confluence, reason)

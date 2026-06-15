@@ -24,5 +24,8 @@ ATR_PERIOD = 14
 SUPERTREND_PERIOD = 14
 SUPERTREND_MULT = 3.0
 
+ADX_PERIOD = 14
+ADX_THRESHOLD = 25
+
 TRADE_LOG = "data/trades.json"
 EQUITY_LOG = "data/equity_curve.json"
