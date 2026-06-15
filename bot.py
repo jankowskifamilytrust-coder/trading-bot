@@ -10,7 +10,7 @@ from config import (
     TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
-    TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
+    TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_PERIOD, EMA_BAND_PCT,
@@ -46,7 +46,7 @@ def save_json(filepath, data):
 
 def init_files():
     os.makedirs("data", exist_ok=True)
-    for filepath, default in [(TRADE_LOG, []), (EQUITY_LOG, []), (TRAILING_STOP_LOG, {})]:
+    for filepath, default in [(TRADE_LOG, []), (EQUITY_LOG, []), (TRAILING_STOP_LOG, {}), (LOC_LOG, {})]:
         try:
             with open(filepath, "r") as f:
                 json.load(f)
@@ -132,6 +132,28 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
             start_time = end_time - (48 * 60 * 60 * 1000)
             candles = mainnet_info.candles_snapshot(symbol, "1h", start_time, end_time)
 
+            # Drop any partially-formed bar — all signals must be computed on the
+            # most recent *fully closed* 60-min bar only.
+            interval_ms = INTERVAL_MINUTES * 60 * 1000
+            if candles:
+                try:
+                    age_ms = end_time - int(candles[-1]['t'])
+                    if age_ms < interval_ms:
+                        candles = candles[:-1]
+                        logger.debug(
+                            f"{symbol}: forming bar dropped ({age_ms//60000}min old); "
+                            f"closed bar t={candles[-1]['t'] if candles else 'n/a'}"
+                        )
+                    else:
+                        logger.debug(
+                            f"{symbol}: last bar confirmed closed (age {age_ms//60000}min), t={candles[-1]['t']}"
+                        )
+                except (KeyError, TypeError):
+                    pass  # no 't' field — can't verify, proceed
+            if not candles:
+                logger.warning(f"{symbol}: no closed bars after dropping forming bar — skipping")
+                return None
+
             candle_summary = "\n".join([
                 f"  open={c['o']} high={c['h']} low={c['l']} close={c['c']} volume={c['v']}"
                 for c in candles[-10:]
@@ -158,6 +180,13 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 h4_end = int(time.time() * 1000)
                 h4_start = h4_end - (30 * 24 * 60 * 60 * 1000)
                 candles_4h = mainnet_info.candles_snapshot(symbol, "4h", h4_start, h4_end)
+                # Drop forming 4h bar
+                if candles_4h:
+                    try:
+                        if h4_end - int(candles_4h[-1]['t']) < 4 * 60 * 60 * 1000:
+                            candles_4h = candles_4h[:-1]
+                    except (KeyError, TypeError):
+                        pass
                 rsi_4h = compute_rsi(candles_4h, period=RSI_PERIOD, lookback=3)
                 ema_4h_now  = compute_ema(candles_4h, period=EMA_PERIOD)
                 ema_4h_prev = compute_ema(candles_4h[:-3], period=EMA_PERIOD) \
@@ -454,6 +483,137 @@ def clear_peak(symbol):
     if symbol in peaks:
         del peaks[symbol]
         _save_peaks(peaks)
+
+
+# ─── Pending LOC Orders ───────────────────────────────────────────────────────
+
+def _load_pending_loc():
+    return load_json(LOC_LOG, {})
+
+def _save_pending_loc(pending):
+    save_json(LOC_LOG, pending)
+
+def check_pending_loc(positions, all_data, equity):
+    """
+    Called at the start of each cycle. For each pending LOC order:
+    - Position now open → order filled while we slept → finalize the trade.
+    - Position still closed → order did not fill by bar close → cancel it.
+    """
+    pending = _load_pending_loc()
+    if not pending:
+        return
+
+    to_remove = []
+    for symbol, meta in list(pending.items()):
+        oid       = meta['oid']
+        direction = "LONG" if meta['is_buy'] else "SHORT"
+
+        if symbol in positions:
+            logger.info(f"{symbol} LOC {direction} filled while sleeping — finalizing")
+            _finalize_open(
+                symbol, direction, meta['is_buy'],
+                meta['notional_usd'], meta.get('atr_val'),
+                meta['cvd_signal'], meta['oi_signal'],
+                meta['confluence'], meta['reason'],
+                equity,
+                sym_data=all_data.get(symbol, {}),
+            )
+        else:
+            logger.info(f"{symbol} LOC {direction} unfilled at bar close — cancelling (oid {oid})")
+            try:
+                cancel_order(symbol, oid)
+            except Exception as e:
+                logger.warning(f"{symbol} LOC cancel failed: {e}")
+            send_telegram(f"⌛ <b>{symbol} {direction} LOC expired</b>\nOrder at ${meta['limit_px']:.4f} cancelled (no fill)")
+        to_remove.append(symbol)
+
+    for symbol in to_remove:
+        del pending[symbol]
+    _save_pending_loc(pending)
+
+
+def place_loc_order(symbol, is_long, all_data, equity, cvd_signal, oi_signal):
+    """
+    Limit-on-close entry. Signals are computed on the just-closed bar; this
+    places one post-only limit at the 60-min EMA (the pullback level) and
+    returns immediately. The order rests on the exchange for up to one bar.
+    check_pending_loc() resolves it next cycle: finalizes if filled, cancels if not.
+    """
+    data        = all_data[symbol]
+    ema_val     = data.get('ema20_60')
+    price       = data.get('tn_price') or data.get('price', 0)
+    sz_decimals = data.get('sz_decimals', 3)
+    direction   = "LONG" if is_long else "SHORT"
+    adx_val     = data.get('adx', {}).get('adx', 0)
+
+    if not ema_val:
+        logger.warning(f"{symbol}: no EMA — cannot compute LOC price")
+        return False
+
+    notional_usd, atr_val = compute_notional(symbol, all_data, equity)
+
+    try:
+        hl_exchange.update_leverage(LEVERAGE, symbol, is_cross=True)
+    except Exception as e:
+        logger.warning(f"Could not set leverage for {symbol}: {e}")
+
+    best_bid, best_ask, tick, decimals = get_testnet_book(symbol)
+    if best_bid is None:
+        logger.error(f"{symbol}: no book — cannot place LOC order")
+        return False
+
+    limit_px    = round(ema_val, decimals)
+    size_tokens = round(notional_usd / limit_px, sz_decimals)
+    min_size    = 10 ** (-sz_decimals)
+    if size_tokens < min_size:
+        logger.warning(f"{symbol}: LOC size {size_tokens} below min {min_size} — skipping")
+        return False
+
+    logger.info(
+        f"{symbol} {direction} LOC: limit at EMA ${limit_px:.{decimals}f} "
+        f"(market ${price:.{decimals}f}) | {size_tokens} tokens (${notional_usd:.0f} notional)"
+    )
+
+    status, oid, fpx, fsz, err = place_alo_limit(symbol, is_long, size_tokens, limit_px)
+
+    if status == 'filled':
+        logger.success(f"{symbol} LOC filled immediately at ${fpx:.4f}")
+        return _finalize_open(
+            symbol, direction, is_long, notional_usd, atr_val,
+            cvd_signal, oi_signal,
+            confluence="7/7 LOC",
+            reason=f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
+            equity=equity, sym_data=data,
+        )
+
+    if status == 'resting':
+        pending = _load_pending_loc()
+        pending[symbol] = {
+            "oid":         oid,
+            "is_buy":      is_long,
+            "limit_px":    limit_px,
+            "notional_usd": notional_usd,
+            "atr_val":     atr_val,
+            "cvd_signal":  cvd_signal,
+            "oi_signal":   oi_signal,
+            "confluence":  "7/7 LOC",
+            "reason":      f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
+            "placed_at":   datetime.now().isoformat(),
+        }
+        _save_pending_loc(pending)
+        logger.info(
+            f"{symbol} {direction} LOC resting @ ${limit_px:.{decimals}f} (oid {oid}) — "
+            f"will cancel if unfilled next cycle"
+        )
+        send_telegram(
+            f"⏳ <b>{symbol} {direction} LOC placed</b>\n"
+            f"Limit: ${limit_px:.4f} (EMA) | Market: ${price:.4f}\n"
+            f"Cancels if unfilled by next bar close"
+        )
+        return True
+
+    logger.info(f"{symbol} LOC {status}: {err}")
+    return False
 
 
 def check_stops(positions, all_data, equity):
@@ -897,9 +1057,13 @@ def run_bot():
             equity    = get_equity()
 
             logger.info(f"Equity: ${equity:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
+
+            # ── Step 0: Resolve pending LOC orders from last cycle ─────────────
+            check_pending_loc(positions, all_data, equity)
+
             log_equity(equity, all_data, positions)
 
-            # ── Step 1: Automatic stops (chandelier + Supertrend flip) ────────
+            # ── Step 1: Automatic stops ────────────────────────────────────────
             if positions:
                 stopped = check_stops(positions, all_data, equity)
                 if stopped:
@@ -907,10 +1071,13 @@ def run_bot():
                     positions = get_open_positions()
                     equity    = get_equity()
 
-            # ── Step 2: Rule-based entry (only if slot available + heat OK) ────
-            if len(positions) < MAX_POSITIONS:
+            # ── Step 2: LOC entry (only if slot available, no pending order, heat OK)
+            pending_syms = set(_load_pending_loc().keys())
+            if len(positions) < MAX_POSITIONS and len(pending_syms) + len(positions) < MAX_POSITIONS:
                 logger.info("Scanning for entry setups...")
-                entry_sym, is_long = select_entry(all_data, positions)
+                # Treat pending symbols as taken slots so select_entry skips them
+                occupied = {**positions, **{sym: {"side": "PENDING"} for sym in pending_syms}}
+                entry_sym, is_long = select_entry(all_data, occupied)
                 if entry_sym:
                     open_risk = sum(
                         abs(p['size']) * (all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
@@ -922,18 +1089,11 @@ def run_bot():
                         logger.info(
                             f"Heat {heat_pct*100:.1f}% ≥ {MAX_PORTFOLIO_RISK_PCT*100:.0f}% cap — skipping {entry_sym}"
                         )
-                        entry_sym = None
-                    data       = all_data[entry_sym]
-                    cvd_signal = data.get('cvd', {}).get('cvd_trend', 'neutral')
-                    oi_signal  = data.get('oi', {}).get('oi_signal', 'stable')
-                    adx_val    = data.get('adx', {}).get('adx', 0)
-                    open_position(
-                        entry_sym, is_long, all_data, equity,
-                        cvd_signal, oi_signal,
-                        confluence="7/7 rule-based",
-                        reason=f"All 7 conditions met (ADX={adx_val:.1f})"
-                    )
-                    time.sleep(SETTLE_SECONDS)
+                    else:
+                        data       = all_data[entry_sym]
+                        cvd_signal = data.get('cvd', {}).get('cvd_trend', 'neutral')
+                        oi_signal  = data.get('oi', {}).get('oi_signal', 'stable')
+                        place_loc_order(entry_sym, is_long, all_data, equity, cvd_signal, oi_signal)
 
             positions = get_open_positions()
             equity    = get_equity()
