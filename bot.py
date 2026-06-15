@@ -678,10 +678,11 @@ def print_summary(equity, positions, all_data):
         pos_lines_tg = "None\n"
 
     logger.info("---------------------------------------")
-    longs = len([t for t in real_trades if t['action'] == 'BUY'])
-    shorts = len([t for t in real_trades if t['action'] == 'SELL'])
-    closes = len([t for t in trades if t['action'] == 'CLOSE'])
-    logger.info(f"Trade counts: Longs={longs} Shorts={shorts} Closes={closes}")
+    open_longs = sum(1 for p in positions.values() if p['side'] == 'LONG')
+    open_shorts = sum(1 for p in positions.values() if p['side'] == 'SHORT')
+    total_opens = len(real_trades)
+    total_closes = len([t for t in trades if t['action'] == 'CLOSE'])
+    logger.info(f"Open now: L:{open_longs} S:{open_shorts} | All-time: opens={total_opens} closes={total_closes}")
     logger.info("=======================================")
 
     pnl_emoji = "📈" if total_pnl >= 0 else "📉"
@@ -690,8 +691,8 @@ def print_summary(equity, positions, all_data):
         f"Equity: ${equity:.2f}\n"
         f"Total P&L: {tsign}${total_pnl:.2f} ({tsign}{total_pnl_pct:.2f}%)\n"
         f"Realized: {rsign}${realized_pnl:.2f} | Unrealized: {usign}${unrealized_pnl:.2f}\n"
-        f"Positions: {len(positions)}/{MAX_POSITIONS} | "
-        f"L:{longs} S:{shorts} C:{closes}\n"
+        f"Positions: {len(positions)}/{MAX_POSITIONS} (L:{open_longs} S:{open_shorts})\n"
+        f"All-time: {total_opens} opens · {total_closes} closes\n"
         f"\n<b>Open:</b>\n{pos_lines_tg}"
     )
 
