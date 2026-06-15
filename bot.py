@@ -1,137 +1,27 @@
 import os
 import time
 import json
-import requests
 import anthropic
 from datetime import datetime
 from dotenv import load_dotenv
-from eth_account import Account
-from hyperliquid.info import Info
-from hyperliquid.exchange import Exchange
-from hyperliquid.utils import constants
 from loguru import logger
 
-# Load keys
+from config import (
+    TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
+    SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
+    VOL_TARGET_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
+    TRADE_LOG, EQUITY_LOG,
+)
+from notify import send_telegram
+from signals import compute_daily_vol, compute_atr, compute_cvd, compute_obi, compute_vpin, compute_oi
+from exchange import (
+    mainnet_info, exchange as hl_exchange,
+    get_testnet_coins, get_testnet_price_map, get_testnet_book,
+    place_alo_limit, cancel_order, get_open_positions, get_equity, wait_until,
+)
+
 load_dotenv()
-wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
 claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-# Telegram
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logger.warning(f"Telegram send failed: {e}")
-
-# SPLIT: mainnet for data/signals, testnet for trading + execution pricing
-mainnet_info = Info(constants.MAINNET_API_URL, skip_ws=True)
-testnet_info = Info(constants.TESTNET_API_URL, skip_ws=True)
-exchange = Exchange(wallet, constants.TESTNET_API_URL)
-
-# Cache of coins actually tradeable on testnet
-_TESTNET_COINS = None
-
-def get_testnet_coins():
-    global _TESTNET_COINS
-    if _TESTNET_COINS is None:
-        try:
-            meta = testnet_info.meta()
-            _TESTNET_COINS = {a['name'] for a in meta['universe']}
-            logger.info(f"Testnet supports {len(_TESTNET_COINS)} tradeable perps")
-        except Exception as e:
-            logger.error(f"Could not fetch testnet coins: {e}")
-            _TESTNET_COINS = set()
-    return _TESTNET_COINS
-
-def get_testnet_price_map():
-    price_map = {}
-    try:
-        ctxs_data = testnet_info.meta_and_asset_ctxs()
-        universe = ctxs_data[0]['universe']
-        ctxs = ctxs_data[1]
-        for i, a in enumerate(universe):
-            if i < len(ctxs):
-                ctx = ctxs[i]
-                mid = ctx.get('midPx') or ctx.get('markPx')
-                oracle = ctx.get('oraclePx')
-                if mid and oracle:
-                    mid = float(mid); oracle = float(oracle)
-                    gap_pct = abs(mid - oracle) / oracle * 100 if oracle else 0
-                    price_map[a['name']] = {"price": mid, "oracle": oracle, "gap_pct": gap_pct}
-    except Exception as e:
-        logger.warning(f"Could not fetch testnet price map: {e}")
-    return price_map
-
-def get_testnet_book(symbol):
-    """Return (best_bid, best_ask, tick, decimals) from the testnet L2 book.
-    Prices come straight from the book so they're always tick-valid."""
-    try:
-        l2 = testnet_info.l2_snapshot(symbol)
-        bids = l2['levels'][0]
-        asks = l2['levels'][1]
-
-        def px(level):
-            return float(level['px']) if isinstance(level, dict) else float(level[0])
-
-        best_bid = px(bids[0])
-        best_ask = px(asks[0])
-
-        # tick from adjacent levels, fallback to spread
-        if len(asks) >= 2:
-            tick = abs(px(asks[1]) - px(asks[0]))
-        elif len(bids) >= 2:
-            tick = abs(px(bids[0]) - px(bids[1]))
-        else:
-            tick = abs(best_ask - best_bid)
-        if tick <= 0:
-            tick = abs(best_ask - best_bid)
-
-        # decimals from the best-ask price string
-        s = str(asks[0]['px']) if isinstance(asks[0], dict) else str(asks[0][0])
-        decimals = len(s.split('.')[1]) if '.' in s else 0
-
-        return best_bid, best_ask, tick, decimals
-    except Exception as e:
-        logger.warning(f"Book fetch failed for {symbol}: {e}")
-        return None, None, None, None
-
-# Dynamic symbol selection
-TOP_N = 10
-PINNED = ["BTC", "ETH", "SOL", "HYPE"]
-STABLECOINS = {
-    "USDC", "USDT", "USDE", "USDT0", "DAI", "FDUSD", "TUSD",
-    "USDD", "PYUSD", "USDB", "USDX", "FRAX", "LUSD", "GUSD",
-    "USDHL", "USR", "USD", "USDC0"
-}
-
-# Risk settings
-MAX_POSITIONS = 3
-LEVERAGE = 2
-INTERVAL_MINUTES = 60
-SLIPPAGE = 0.05            # used for market fallback / stop / flip closes
-SETTLE_SECONDS = 3
-MAX_ORACLE_GAP_PCT = 3.0
-MAKER_WAIT_SECONDS = 30    # how long to let a post-only order rest before repricing/giving up
-
-# Volatility-based position sizing
-VOL_TARGET_PCT = 0.02
-MAX_NOTIONAL_USD = 200
-MIN_NOTIONAL_USD = 20
-
-# ATR-based stop-loss (evaluated each cycle = hourly)
-STOP_ATR_MULT = 3.0
-ATR_PERIOD = 14
-
-# Log files
-TRADE_LOG = "trades.json"
-EQUITY_LOG = "equity_curve.json"
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -147,6 +37,7 @@ def save_json(filepath, data):
         json.dump(data, f, indent=2)
 
 def init_files():
+    os.makedirs("data", exist_ok=True)
     for filepath, default in [(TRADE_LOG, []), (EQUITY_LOG, [])]:
         try:
             with open(filepath, "r") as f:
@@ -218,185 +109,6 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
         fallback = ["BTC", "ETH", "SOL", "HYPE"]
         return list(set(fallback + extra_symbols))
 
-# ─── Equity ───────────────────────────────────────────────────────────────────
-
-def get_equity():
-    try:
-        spot_state = testnet_info.spot_user_state(wallet.address)
-        for b in spot_state.get('balances', []):
-            if b.get('coin') == 'USDC':
-                return float(b.get('total', 0))
-    except Exception as e:
-        logger.error(f"Equity read error: {e}")
-    try:
-        user_state = testnet_info.user_state(wallet.address)
-        return float(user_state['marginSummary']['accountValue'])
-    except Exception:
-        return 0.0
-
-# ─── Signals (from MAINNET) ───────────────────────────────────────────────────
-
-def compute_daily_vol(candles):
-    try:
-        closes = [float(c['c']) for c in candles]
-        if len(closes) < 6:
-            return None
-        returns = []
-        for i in range(1, len(closes)):
-            if closes[i-1] > 0:
-                returns.append((closes[i] - closes[i-1]) / closes[i-1])
-        if len(returns) < 5:
-            return None
-        mean = sum(returns) / len(returns)
-        variance = sum((r - mean) ** 2 for r in returns) / len(returns)
-        hourly_vol = variance ** 0.5
-        return hourly_vol * (24 ** 0.5)
-    except Exception:
-        return None
-
-def compute_atr(candles, period=ATR_PERIOD):
-    try:
-        if len(candles) < period + 1:
-            period = max(2, len(candles) - 1)
-        trs = []
-        for i in range(1, len(candles)):
-            h = float(candles[i]['h'])
-            l = float(candles[i]['l'])
-            prev_c = float(candles[i-1]['c'])
-            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-            trs.append(tr)
-        if not trs:
-            return None
-        recent = trs[-period:]
-        return sum(recent) / len(recent)
-    except Exception:
-        return None
-
-def compute_cvd(candles):
-    cvd = 0.0
-    cvd_series = []
-    for c in candles:
-        o = float(c['o']); cl = float(c['c']); v = float(c['v'])
-        h = float(c['h']); l = float(c['l'])
-        rng = h - l + 1e-9
-        delta = v * ((cl - o) / rng) if cl >= o else -v * ((o - cl) / rng)
-        cvd += delta
-        cvd_series.append(cvd)
-
-    cvd_trend = "rising" if len(cvd_series) >= 5 and cvd_series[-1] > cvd_series[-5] else "falling"
-
-    divergence = "unknown"
-    if len(candles) >= 5:
-        price_change = float(candles[-1]['c']) - float(candles[-5]['c'])
-        cvd_change = cvd_series[-1] - cvd_series[-5] if len(cvd_series) >= 5 else 0
-        if price_change > 0 and cvd_change < 0:
-            divergence = "bearish divergence (price up, CVD down)"
-        elif price_change < 0 and cvd_change > 0:
-            divergence = "bullish divergence (price down, CVD up)"
-        else:
-            divergence = "no divergence"
-
-    return {"cvd": round(cvd, 2), "cvd_trend": cvd_trend, "divergence": divergence}
-
-def compute_obi(l2_data):
-    try:
-        bids = l2_data['levels'][0][:10]
-        asks = l2_data['levels'][1][:10]
-        def sz(level):
-            return float(level['sz']) if isinstance(level, dict) else float(level[1])
-        bid_vol = sum(sz(b) for b in bids)
-        ask_vol = sum(sz(a) for a in asks)
-        total = bid_vol + ask_vol
-        if total == 0:
-            return {"obi": 0.0, "signal": "neutral", "bid_vol": 0, "ask_vol": 0}
-        obi = (bid_vol - ask_vol) / total
-        signal = "bullish (bid heavy)" if obi > 0.3 else "bearish (ask heavy)" if obi < -0.3 else "neutral"
-        return {"obi": round(obi, 3), "signal": signal, "bid_vol": round(bid_vol, 2), "ask_vol": round(ask_vol, 2)}
-    except Exception:
-        return {"obi": 0.0, "signal": "unknown", "bid_vol": 0, "ask_vol": 0}
-
-def compute_vpin(candles, bucket_size=10):
-    try:
-        buy_vols, sell_vols = [], []
-        for c in candles:
-            h, l, cl, v = float(c['h']), float(c['l']), float(c['c']), float(c['v'])
-            rng = h - l + 1e-9
-            buy_vols.append(v * ((cl - l) / rng))
-            sell_vols.append(v * ((h - cl) / rng))
-        if len(buy_vols) < bucket_size:
-            return {"vpin": 0.5, "signal": "insufficient data"}
-        vpins = []
-        for i in range(len(buy_vols) - bucket_size + 1):
-            b = sum(buy_vols[i:i+bucket_size])
-            s = sum(sell_vols[i:i+bucket_size])
-            vpins.append(abs(b - s) / (b + s + 1e-9))
-        vpin = round(vpins[-1], 3)
-        signal = ("high (informed trading — expect volatility)" if vpin > 0.4
-                  else "moderate" if vpin > 0.25 else "low (retail flow)")
-        return {"vpin": vpin, "signal": signal}
-    except Exception:
-        return {"vpin": 0.5, "signal": "unknown"}
-
-def compute_oi(symbol, candles, price):
-    try:
-        asset_contexts = mainnet_info.meta_and_asset_ctxs()
-        meta = asset_contexts[0]['universe']
-        ctxs = asset_contexts[1]
-        symbol_idx = next((i for i, a in enumerate(meta) if a['name'] == symbol), None)
-        if symbol_idx is None or symbol_idx >= len(ctxs):
-            return {"oi_usd": 0, "oi_tokens": 0, "vol_change_pct": 0,
-                    "oi_vol_ratio": 0, "oi_signal": "unavailable",
-                    "funding": 0, "funding_signal": "unavailable", "day_volume": 0}
-        ctx = ctxs[symbol_idx]
-        oi_tokens = float(ctx.get('openInterest', 0))
-        funding = float(ctx.get('funding', 0)) * 100
-        day_volume = float(ctx.get('dayNtlVlm', 0))
-        oi_usd = round(oi_tokens * price, 2)
-
-        if len(candles) >= 8:
-            recent_vol = sum(float(c['v']) for c in candles[-4:])
-            prev_vol = sum(float(c['v']) for c in candles[-8:-4])
-            vol_change_pct = ((recent_vol - prev_vol) / (prev_vol + 1e-9)) * 100
-        else:
-            vol_change_pct = 0
-
-        last_vol = float(candles[-1]['v']) if candles else 1
-        oi_vol_ratio = round(oi_tokens / (last_vol + 1e-9), 2)
-
-        if vol_change_pct > 15:
-            oi_signal = "rising fast — strong conviction, new money entering"
-        elif vol_change_pct > 5:
-            oi_signal = "rising — trend has momentum"
-        elif vol_change_pct < -15:
-            oi_signal = "falling fast — positions unwinding, trend weakening"
-        elif vol_change_pct < -5:
-            oi_signal = "falling — losing momentum"
-        else:
-            oi_signal = "stable — no strong conviction either way"
-
-        if funding > 0.05:
-            funding_signal = "high positive (longs paying — crowded long, potential squeeze)"
-        elif funding > 0.01:
-            funding_signal = "positive (mild long bias)"
-        elif funding < -0.05:
-            funding_signal = "high negative (shorts paying — crowded short, potential squeeze)"
-        elif funding < -0.01:
-            funding_signal = "negative (mild short bias)"
-        else:
-            funding_signal = "neutral"
-
-        return {
-            "oi_usd": oi_usd, "oi_tokens": round(oi_tokens, 2),
-            "vol_change_pct": round(vol_change_pct, 2), "oi_vol_ratio": oi_vol_ratio,
-            "oi_signal": oi_signal, "funding": round(funding, 4),
-            "funding_signal": funding_signal, "day_volume": day_volume
-        }
-    except Exception as e:
-        logger.error(f"OI fetch error for {symbol}: {e}")
-        return {"oi_usd": 0, "oi_tokens": 0, "vol_change_pct": 0,
-                "oi_vol_ratio": 0, "oi_signal": "unavailable",
-                "funding": 0, "funding_signal": "unavailable", "day_volume": 0}
-
 # ─── Market Data ──────────────────────────────────────────────────────────────
 
 def get_symbol_data(symbol, max_retries=3, retry_delay=5):
@@ -433,7 +145,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "cvd": compute_cvd(candles),
                 "obi": compute_obi(l2),
                 "vpin": compute_vpin(candles),
-                "oi": compute_oi(symbol, candles, price)
+                "oi": compute_oi(symbol, candles, price, mainnet_info),
             }
         except Exception as e:
             if attempt < max_retries:
@@ -485,73 +197,7 @@ def get_all_market_data(symbols, open_position_syms=None):
         logger.warning(f"Symbols skipped this cycle: {', '.join(failed)}")
     return all_data
 
-# ─── Positions ────────────────────────────────────────────────────────────────
-
-def get_open_positions():
-    positions = {}
-    try:
-        state = testnet_info.user_state(wallet.address)
-        for p in state.get('assetPositions', []):
-            pos = p.get('position', {})
-            coin = pos.get('coin')
-            size = float(pos.get('szi', 0))
-            entry = float(pos.get('entryPx', 0))
-            if size != 0:
-                positions[coin] = {
-                    "size": size, "entry": entry,
-                    "side": "LONG" if size > 0 else "SHORT"
-                }
-    except Exception as e:
-        logger.error(f"Position check error: {e}")
-    return positions
-
-# ─── Maker / Taker order primitives ───────────────────────────────────────────
-
-def place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=False):
-    """
-    Place a post-only (Add-Liquidity-Only) limit order.
-    Returns (status, oid, fill_px, fill_sz, err) where status is one of
-    'filled' | 'resting' | 'rejected' | 'error'.
-    ALO never pays taker: if it would cross the book it's rejected, not filled.
-    """
-    order_type = {"limit": {"tif": "Alo"}}
-    try:
-        result = exchange.order(symbol, is_buy, size_tokens, limit_px, order_type, reduce_only=reduce_only)
-        statuses = result.get('response', {}).get('data', {}).get('statuses', [])
-        for s in statuses:
-            if 'resting' in s:
-                return 'resting', s['resting'].get('oid'), None, None, ''
-            if 'filled' in s:
-                f = s['filled']
-                return 'filled', f.get('oid'), float(f.get('avgPx', limit_px)), float(f.get('totalSz', size_tokens)), ''
-            if 'error' in s:
-                return 'rejected', None, None, None, s['error']
-        return 'error', None, None, None, f"unexpected response: {result}"
-    except Exception as e:
-        return 'error', None, None, None, str(e)
-
-def cancel_order(symbol, oid):
-    if oid is None:
-        return
-    try:
-        exchange.cancel(symbol, oid)
-        logger.info(f"Cancelled resting order {oid} on {symbol}")
-    except Exception as e:
-        logger.warning(f"Cancel {symbol} oid {oid} failed (may have already filled): {e}")
-
-def wait_until(symbol, want_open, seconds):
-    """Poll positions until symbol is open (want_open=True) or closed (False), or timeout."""
-    waited = 0
-    step = 10
-    while waited < seconds:
-        time.sleep(min(step, seconds - waited))
-        waited += step
-        is_open = symbol in get_open_positions()
-        if is_open == want_open:
-            return True
-    return (symbol in get_open_positions()) == want_open
-
-# ─── Volatility sizing helper ─────────────────────────────────────────────────
+# ─── Position Sizing ──────────────────────────────────────────────────────────
 
 def compute_notional(symbol, all_data, equity):
     daily_vol = all_data[symbol].get('daily_vol')
@@ -575,18 +221,16 @@ def open_position(symbol, is_buy, all_data, equity,
     """
     Post-only maker entry. Two attempts: passive (at touch), then aggressive
     (one tick inside, toward mid). If neither fills, the trade is skipped.
-    Returns True only if a position actually opened.
     """
     sz_decimals = all_data[symbol].get('sz_decimals', 3)
     notional_usd, daily_vol = compute_notional(symbol, all_data, equity)
     direction = "LONG" if is_buy else "SHORT"
 
     try:
-        exchange.update_leverage(LEVERAGE, symbol, is_cross=True)
+        hl_exchange.update_leverage(LEVERAGE, symbol, is_cross=True)
     except Exception as e:
         logger.warning(f"Could not set leverage for {symbol}: {e}")
 
-    # Two price attempts: passive first, then aggressive (toward mid)
     for attempt in (1, 2):
         best_bid, best_ask, tick, decimals = get_testnet_book(symbol)
         if best_bid is None:
@@ -595,14 +239,13 @@ def open_position(symbol, is_buy, all_data, equity,
             return False
 
         if attempt == 1:
-            limit_px = best_bid if is_buy else best_ask          # passive: join the touch
+            limit_px = best_bid if is_buy else best_ask
             tag = "passive"
         else:
-            limit_px = (best_ask - tick) if is_buy else (best_bid + tick)  # aggressive: 1 tick toward mid
+            limit_px = (best_ask - tick) if is_buy else (best_bid + tick)
             tag = "aggressive"
         limit_px = round(limit_px, decimals)
 
-        # size from notional / limit price
         size_tokens = round(notional_usd / limit_px, sz_decimals)
         min_size = 10 ** (-sz_decimals)
         if size_tokens < min_size:
@@ -627,13 +270,11 @@ def open_position(symbol, is_buy, all_data, equity,
             send_telegram(f"⚠️ <b>{symbol} {direction} order error</b>\n{err[:200]}")
             return False
 
-        # status == 'resting' — wait for a fill
         logger.info(f"{symbol} resting (oid {oid}) — waiting up to {MAKER_WAIT_SECONDS}s for fill")
         filled = wait_until(symbol, want_open=True, seconds=MAKER_WAIT_SECONDS)
         if filled:
             return _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
                                   cvd_signal, obi_signal, oi_signal, confluence, reason, equity)
-        # not filled → cancel and try next attempt
         cancel_order(symbol, oid)
         logger.info(f"{symbol} {tag} maker order unfilled in {MAKER_WAIT_SECONDS}s")
 
@@ -672,9 +313,9 @@ def close_position_market(symbol, all_data, equity, reason,
     exec_price = all_data.get(symbol, {}).get('tn_price') or all_data.get(symbol, {}).get('price', 0)
     try:
         if exec_price:
-            result = exchange.market_close(symbol, None, exec_price, SLIPPAGE)
+            result = hl_exchange.market_close(symbol, None, exec_price, SLIPPAGE)
         else:
-            result = exchange.market_close(symbol)
+            result = hl_exchange.market_close(symbol)
         logger.info(f"Market close result: {result}")
         statuses = result.get('response', {}).get('data', {}).get('statuses', [])
         filled = any('filled' in s for s in statuses)
@@ -712,12 +353,12 @@ def close_position_maker(symbol, all_data, equity, reason,
     if not pos:
         logger.warning(f"{symbol}: no position to close")
         return False
-    is_buy = pos['side'] == "SHORT"     # buy to close a short, sell to close a long
+    is_buy = pos['side'] == "SHORT"
     size_tokens = abs(pos['size'])
 
     best_bid, best_ask, tick, decimals = get_testnet_book(symbol)
     if best_bid is not None:
-        limit_px = best_ask if not is_buy else best_bid   # passive: sell at ask / buy at bid
+        limit_px = best_ask if not is_buy else best_bid
         limit_px = round(limit_px, decimals)
         logger.info(f"{symbol} maker close attempt: {size_tokens} @ ${limit_px:.{decimals}f}")
         status, oid, fpx, fsz, err = place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=True)
@@ -733,11 +374,10 @@ def close_position_maker(symbol, all_data, equity, reason,
         else:
             logger.info(f"{symbol} maker close not resting ({status}: {err}) — falling back to market")
 
-    # Fallback: guaranteed market close
     return close_position_market(symbol, all_data, equity, f"{reason} (market fallback)",
                                  cvd_signal, obi_signal, oi_signal, confluence)
 
-# ─── ATR Stop-Loss (always market exit) ───────────────────────────────────────
+# ─── ATR Stop-Loss ────────────────────────────────────────────────────────────
 
 def check_stops(positions, all_data, equity):
     closed_any = False
@@ -770,7 +410,6 @@ def check_stops(positions, all_data, equity):
                 f"Entry: ${entry:.4f} → Now: ${price:.4f}\n"
                 f"Stop: ${stop_price:.4f} ({STOP_ATR_MULT}×ATR) — market close"
             )
-            # Stops ALWAYS use a market order — the exit must fill
             if close_position_market(sym, all_data, equity, f"ATR stop ({STOP_ATR_MULT}×ATR) breached"):
                 closed_any = True
                 time.sleep(1)
@@ -872,7 +511,7 @@ REASON: one sentence explaining the directional orderflow confluence
     )
     return message.content[0].text
 
-# ─── Decision routing ─────────────────────────────────────────────────────────
+# ─── Decision Routing ─────────────────────────────────────────────────────────
 
 def _parse_decision(text):
     fields = {}

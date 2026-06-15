@@ -5,8 +5,8 @@ import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
 from datetime import datetime
 
-EQUITY_LOG = "equity_curve.json"
-TRADE_LOG = "trades.json"
+EQUITY_LOG = "data/equity_curve.json"
+TRADE_LOG = "data/trades.json"
 SYMBOLS = ["HYPE", "ZEC", "ONDO", "NEAR", "BTC", "SOL", "ETH"]
 REFRESH_SECONDS = 60
 
