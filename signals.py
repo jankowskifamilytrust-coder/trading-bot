@@ -1,5 +1,5 @@
 from loguru import logger
-from config import ATR_PERIOD
+from config import ATR_PERIOD, SUPERTREND_PERIOD, SUPERTREND_MULT
 
 
 def compute_daily_vol(candles):
@@ -106,6 +106,68 @@ def compute_vpin(candles, bucket_size=10):
         return {"vpin": vpin, "signal": signal}
     except Exception:
         return {"vpin": 0.5, "signal": "unknown"}
+
+
+def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_MULT):
+    """
+    Daily Supertrend bias filter.
+    Returns direction 'bullish' (price above ST → long bias) or 'bearish' (short bias).
+    'changed' is True when the trend flipped on the latest candle.
+    """
+    try:
+        if len(candles) < period + 2:
+            return {"direction": "neutral", "value": 0.0, "changed": False}
+
+        n = len(candles)
+        H = [float(c['h']) for c in candles]
+        L = [float(c['l']) for c in candles]
+        C = [float(c['c']) for c in candles]
+
+        # True Range (index 0 unused; TR[i] = TR of candle[i])
+        TR = [0.0] + [max(H[i] - L[i], abs(H[i] - C[i-1]), abs(L[i] - C[i-1]))
+                      for i in range(1, n)]
+
+        # ATR per bar — simple MA over `period` TR values
+        ATR = [0.0] * n
+        for i in range(1, n):
+            start = max(1, i - period + 1)
+            ATR[i] = sum(TR[start:i+1]) / (i - start + 1)
+
+        # Bands and Supertrend (computed from index `period` onward)
+        fu = [0.0] * n   # final upper band
+        fl = [0.0] * n   # final lower band
+        st = [0.0] * n   # supertrend value
+
+        hl2 = (H[period] + L[period]) / 2
+        fu[period] = hl2 + multiplier * ATR[period]
+        fl[period] = hl2 - multiplier * ATR[period]
+        st[period] = fl[period]  # start bullish
+
+        for i in range(period + 1, n):
+            hl2 = (H[i] + L[i]) / 2
+            bu = hl2 + multiplier * ATR[i]
+            bl = hl2 - multiplier * ATR[i]
+
+            # Trailing bands: tighten upper, raise lower — using previous close
+            fu[i] = bu if (bu < fu[i-1] or C[i-1] > fu[i-1]) else fu[i-1]
+            fl[i] = bl if (bl > fl[i-1] or C[i-1] < fl[i-1]) else fl[i-1]
+
+            # Flip logic: was bearish → flip bullish if close crosses above upper
+            if st[i-1] == fu[i-1]:
+                st[i] = fl[i] if C[i] > fu[i] else fu[i]
+            else:
+                st[i] = fu[i] if C[i] < fl[i] else fl[i]
+
+        direction      = "bullish" if st[-1] == fl[-1] else "bearish"
+        prev_direction = "bullish" if st[-2] == fl[-2] else "bearish"
+
+        return {
+            "direction": direction,
+            "value": round(st[-1], 6),
+            "changed": direction != prev_direction,
+        }
+    except Exception:
+        return {"direction": "neutral", "value": 0.0, "changed": False}
 
 
 def compute_oi(symbol, candles, price, info):

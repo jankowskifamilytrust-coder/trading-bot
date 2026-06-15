@@ -21,5 +21,8 @@ MIN_NOTIONAL_USD = 20
 STOP_ATR_MULT = 3.0
 ATR_PERIOD = 14
 
+SUPERTREND_PERIOD = 14
+SUPERTREND_MULT = 3.0
+
 TRADE_LOG = "data/trades.json"
 EQUITY_LOG = "data/equity_curve.json"

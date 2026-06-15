@@ -10,10 +10,10 @@ from config import (
     TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
     VOL_TARGET_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
-    TRADE_LOG, EQUITY_LOG,
+    TRADE_LOG, EQUITY_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
 )
 from notify import send_telegram
-from signals import compute_daily_vol, compute_atr, compute_cvd, compute_obi, compute_vpin, compute_oi
+from signals import compute_daily_vol, compute_atr, compute_cvd, compute_obi, compute_vpin, compute_oi, compute_supertrend
 from exchange import (
     mainnet_info, exchange as hl_exchange,
     get_testnet_coins, get_testnet_price_map, get_testnet_book,
@@ -135,6 +135,16 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
             asset_info = next((a for a in meta['universe'] if a['name'] == symbol), None)
             sz_decimals = int(asset_info['szDecimals']) if asset_info else 3
 
+            # Daily candles for Supertrend (90 days → enough for ATR period 14)
+            try:
+                d_end = int(time.time() * 1000)
+                d_start = d_end - (90 * 24 * 60 * 60 * 1000)
+                daily_candles = mainnet_info.candles_snapshot(symbol, "1d", d_start, d_end)
+                supertrend = compute_supertrend(daily_candles)
+            except Exception as e:
+                logger.warning(f"{symbol}: daily candle fetch failed — Supertrend neutral: {e}")
+                supertrend = {"direction": "neutral", "value": 0.0, "changed": False}
+
             return {
                 "symbol": symbol, "price": price,
                 "tn_price": price,
@@ -146,6 +156,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "obi": compute_obi(l2),
                 "vpin": compute_vpin(candles),
                 "oi": compute_oi(symbol, candles, price, mainnet_info),
+                "supertrend": supertrend,
             }
         except Exception as e:
             if attempt < max_retries:
@@ -187,10 +198,12 @@ def get_all_market_data(symbols, open_position_syms=None):
 
     for sym, data in all_data.items():
         vol_str = f"{data['daily_vol']*100:.1f}%" if data['daily_vol'] else "n/a"
+        st = data['supertrend']
+        st_tag = f"ST={st['direction'].upper()}" + (" [FLIP]" if st['changed'] else "")
         logger.info(
             f"  {sym}: testnet ${data['tn_price']:.4f} | DailyVol={vol_str} | "
             f"OI=${data['oi']['oi_usd']:,.0f} | CVD={data['cvd']['cvd_trend']} | "
-            f"OBI={data['obi']['obi']} | Funding={data['oi']['funding']}%"
+            f"OBI={data['obi']['obi']} | Funding={data['oi']['funding']}% | {st_tag}"
         )
 
     if failed:
@@ -423,8 +436,11 @@ def ask_claude(all_data, equity, positions):
         pos = positions.get(symbol)
         pos_str = f"OPEN {pos['side']} {abs(pos['size'])} @ ${pos['entry']:.4f}" if pos else "no position"
         vol_str = f"{data['daily_vol']*100:.1f}%" if data.get('daily_vol') else "n/a"
+        st = data['supertrend']
+        st_flip = " ← TREND JUST FLIPPED" if st['changed'] else ""
         market_summary += f"""
 {symbol} (${data['price']:.4f}) [{pos_str}] | 24h Vol: ${data['oi']['day_volume']:,.0f} | Daily vol: {vol_str}:
+  Supertrend (daily, ATR {SUPERTREND_PERIOD}, ×{SUPERTREND_MULT}): {st['direction'].upper()} @ {st['value']:.4f}{st_flip}
   Candles (last 10h):
 {data['candle_summary']}
   Orderflow:
@@ -463,6 +479,11 @@ Market data + orderflow signals:
 {market_summary}
 
 Signal interpretation guide:
+- Supertrend (daily) is the PRIMARY TREND BIAS — it is enforced as a HARD FILTER:
+    BULLISH Supertrend → only OPEN_LONG is allowed (OPEN_SHORT will be blocked).
+    BEARISH Supertrend → only OPEN_SHORT is allowed (OPEN_LONG will be blocked).
+    CLOSE and FLIP are never blocked by Supertrend.
+    A Supertrend FLIP on the latest daily candle is a strong directional signal.
 - CVD rising = buyers in control (bullish). Falling = sellers (bearish).
 - CVD divergence: price up + CVD down = bearish reversal risk. Price down + CVD up = bullish reversal.
 - OBI >+0.3 = bullish (bid heavy), <-0.3 = bearish (ask heavy), near 0 = neutral.
@@ -473,8 +494,8 @@ Signal interpretation guide:
 - High positive funding = crowded longs, squeeze/reversal down risk → favors SHORT.
 - High negative funding = crowded shorts, squeeze up risk → favors LONG.
 
-LONG setup (OPEN_LONG): CVD rising + OBI bullish + OI rising + funding neutral/negative
-SHORT setup (OPEN_SHORT): CVD falling + OBI bearish + OI rising + funding neutral/positive
+LONG setup (OPEN_LONG): Supertrend BULLISH + CVD rising + OBI bullish + OI rising + funding neutral/negative
+SHORT setup (OPEN_SHORT): Supertrend BEARISH + CVD falling + OBI bearish + OI rising + funding neutral/positive
 Strong reversal where you already hold the wrong side → FLIP
 
 Available actions:
@@ -553,6 +574,13 @@ def execute_decision(decision_text, all_data, equity, positions):
         if len(positions) >= MAX_POSITIONS:
             logger.warning(f"Max positions ({MAX_POSITIONS}) reached — skipping")
             log_trade("SKIPPED", symbol, 0, 0, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
+            return False
+        st_dir = all_data[symbol].get('supertrend', {}).get('direction', 'neutral')
+        if st_dir == 'bearish' and action == "OPEN_LONG":
+            logger.info(f"{symbol} OPEN_LONG blocked — daily Supertrend is BEARISH")
+            return False
+        if st_dir == 'bullish' and action == "OPEN_SHORT":
+            logger.info(f"{symbol} OPEN_SHORT blocked — daily Supertrend is BULLISH")
             return False
         return open_position(symbol, action == "OPEN_LONG", all_data, equity,
                              cvd_signal, obi_signal, oi_signal, confluence, reason)
