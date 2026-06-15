@@ -9,9 +9,15 @@ PINNED = [
     "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META",
 ]
 STABLECOINS = {
-    "USDC", "USDT", "USDE", "USDT0", "DAI", "FDUSD", "TUSD",
-    "USDD", "PYUSD", "USDB", "USDX", "FRAX", "LUSD", "GUSD",
-    "USDHL", "USR", "USD", "USDC0"
+    # USD-pegged
+    "USDC", "USDC0", "USDT", "USDT0", "USDHL",
+    "USD", "USDB", "USDX", "USDD", "USDE", "USDM", "USDY",
+    "DAI", "FRAX", "LUSD", "GUSD", "TUSD", "FDUSD",
+    "PYUSD", "BUSD", "HUSD", "MIM", "DOLA", "GHO", "CRVUSD",
+    "SUSD", "NUSD", "EUSD", "BEAN",
+    "USR",
+    # Euro / other fiat-pegged
+    "EURS", "EURC", "AGEUR", "EURT",
 }
 
 MAX_POSITIONS = 3
