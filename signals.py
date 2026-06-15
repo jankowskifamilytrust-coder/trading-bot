@@ -70,46 +70,6 @@ def compute_cvd(candles):
     return {"cvd": round(cvd, 2), "cvd_trend": cvd_trend, "divergence": divergence}
 
 
-def compute_obi(l2_data):
-    try:
-        bids = l2_data['levels'][0][:10]
-        asks = l2_data['levels'][1][:10]
-        def sz(level):
-            return float(level['sz']) if isinstance(level, dict) else float(level[1])
-        bid_vol = sum(sz(b) for b in bids)
-        ask_vol = sum(sz(a) for a in asks)
-        total = bid_vol + ask_vol
-        if total == 0:
-            return {"obi": 0.0, "signal": "neutral", "bid_vol": 0, "ask_vol": 0}
-        obi = (bid_vol - ask_vol) / total
-        signal = "bullish (bid heavy)" if obi > 0.3 else "bearish (ask heavy)" if obi < -0.3 else "neutral"
-        return {"obi": round(obi, 3), "signal": signal, "bid_vol": round(bid_vol, 2), "ask_vol": round(ask_vol, 2)}
-    except Exception:
-        return {"obi": 0.0, "signal": "unknown", "bid_vol": 0, "ask_vol": 0}
-
-
-def compute_vpin(candles, bucket_size=10):
-    try:
-        buy_vols, sell_vols = [], []
-        for c in candles:
-            h, l, cl, v = float(c['h']), float(c['l']), float(c['c']), float(c['v'])
-            rng = h - l + 1e-9
-            buy_vols.append(v * ((cl - l) / rng))
-            sell_vols.append(v * ((h - cl) / rng))
-        if len(buy_vols) < bucket_size:
-            return {"vpin": 0.5, "signal": "insufficient data"}
-        vpins = []
-        for i in range(len(buy_vols) - bucket_size + 1):
-            b = sum(buy_vols[i:i+bucket_size])
-            s = sum(sell_vols[i:i+bucket_size])
-            vpins.append(abs(b - s) / (b + s + 1e-9))
-        vpin = round(vpins[-1], 3)
-        signal = ("high (informed trading — expect volatility)" if vpin > 0.4
-                  else "moderate" if vpin > 0.25 else "low (retail flow)")
-        return {"vpin": vpin, "signal": signal}
-    except Exception:
-        return {"vpin": 0.5, "signal": "unknown"}
-
 
 def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_MULT):
     """

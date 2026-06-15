@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import anthropic
 from datetime import datetime
 from dotenv import load_dotenv
 from loguru import logger
@@ -17,7 +16,7 @@ from config import (
 )
 from notify import send_telegram
 from signals import (
-    compute_daily_vol, compute_atr, compute_cvd, compute_obi, compute_vpin,
+    compute_daily_vol, compute_atr, compute_cvd,
     compute_oi, compute_supertrend, compute_adx, compute_rsi, compute_ema,
 )
 from exchange import (
@@ -27,7 +26,6 @@ from exchange import (
 )
 
 load_dotenv()
-claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -135,8 +133,6 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 for c in candles[-10:]
             ])
 
-            l2 = mainnet_info.l2_snapshot(symbol)
-
             meta = mainnet_info.meta()
             asset_info = next((a for a in meta['universe'] if a['name'] == symbol), None)
             sz_decimals = int(asset_info['szDecimals']) if asset_info else 3
@@ -161,8 +157,6 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "daily_vol": compute_daily_vol(candles),
                 "atr": compute_atr(candles),
                 "cvd": compute_cvd(candles),
-                "obi": compute_obi(l2),
-                "vpin": compute_vpin(candles),
                 "oi": compute_oi(symbol, candles, price, mainnet_info),
                 "supertrend": supertrend,
                 "adx": adx,
@@ -220,7 +214,7 @@ def get_all_market_data(symbols, open_position_syms=None):
         logger.info(
             f"  {sym}: testnet ${data['tn_price']:.4f} | DailyVol={vol_str} | "
             f"OI=${data['oi']['oi_usd']:,.0f} | CVD={data['cvd']['cvd_trend']} | "
-            f"OBI={data['obi']['obi']} | Funding={data['oi']['funding']}% | {st_tag} | {adx_tag} | "
+            f"Funding={data['oi']['funding']}% | {st_tag} | {adx_tag} | "
             f"{rsi_tag} | {ema_tag}"
         )
 
@@ -248,7 +242,7 @@ def compute_notional(symbol, all_data, equity):
 # ─── Entry (post-only maker) ──────────────────────────────────────────────────
 
 def open_position(symbol, is_buy, all_data, equity,
-                  cvd_signal, obi_signal, oi_signal, confluence, reason):
+                  cvd_signal, oi_signal, confluence, reason):
     """
     Post-only maker entry. Two attempts: passive (at touch), then aggressive
     (one tick inside, toward mid). If neither fills, the trade is skipped.
@@ -290,7 +284,7 @@ def open_position(symbol, is_buy, all_data, equity,
 
         if status == 'filled':
             return _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
-                                  cvd_signal, obi_signal, oi_signal, confluence, reason, equity)
+                                  cvd_signal, oi_signal, confluence, reason, equity)
 
         if status == 'rejected':
             logger.info(f"{symbol} {tag} ALO rejected (would cross / {err}) — trying next")
@@ -305,7 +299,7 @@ def open_position(symbol, is_buy, all_data, equity,
         filled = wait_until(symbol, want_open=True, seconds=MAKER_WAIT_SECONDS)
         if filled:
             return _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
-                                  cvd_signal, obi_signal, oi_signal, confluence, reason, equity)
+                                  cvd_signal, oi_signal, confluence, reason, equity)
         cancel_order(symbol, oid)
         logger.info(f"{symbol} {tag} maker order unfilled in {MAKER_WAIT_SECONDS}s")
 
@@ -314,7 +308,7 @@ def open_position(symbol, is_buy, all_data, equity,
     return False
 
 def _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
-                   cvd_signal, obi_signal, oi_signal, confluence, reason, equity):
+                   cvd_signal, oi_signal, confluence, reason, equity):
     pos = get_open_positions().get(symbol)
     fill_px = pos['entry'] if pos else 0
     fill_sz = abs(pos['size']) if pos else 0
@@ -324,7 +318,7 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
         init_peak(symbol, fill_px)
     action_label = "BUY" if is_buy else "SELL"
     log_trade(action_label, symbol, fill_sz, fill_px, reason, equity,
-              cvd_signal, obi_signal, oi_signal, confluence)
+              cvd_signal, oi_signal, confluence)
     emoji = "🟢" if is_buy else "🟠"
     vol_pct = f"{daily_vol*100:.1f}%" if daily_vol else "n/a"
     send_telegram(
@@ -341,8 +335,8 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
 # ─── Exits ────────────────────────────────────────────────────────────────────
 
 def close_position_market(symbol, all_data, equity, reason,
-                          cvd_signal="", obi_signal="", oi_signal="", confluence=""):
-    """Guaranteed-fill taker close. Used for stops, flips, and as maker-close fallback."""
+                          cvd_signal="", oi_signal="", confluence=""):
+    """Guaranteed-fill market close. Used for all automatic exits."""
     exec_price = all_data.get(symbol, {}).get('tn_price') or all_data.get(symbol, {}).get('price', 0)
     try:
         if exec_price:
@@ -358,10 +352,10 @@ def close_position_market(symbol, all_data, equity, reason,
             if 'filled' in s:
                 fill_px = float(s['filled'].get('avgPx', exec_price))
         if filled or symbol not in get_open_positions():
-            logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (taker)")
+            logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (market)")
             clear_peak(symbol)
             log_trade("CLOSE", symbol, 0, fill_px, reason, equity,
-                      cvd_signal, obi_signal, oi_signal, confluence)
+                      cvd_signal, oi_signal, confluence)
             send_telegram(f"🔴 <b>CLOSE</b> (market)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
             return True
         logger.error(f"❌ CLOSE {symbol} REJECTED: {err}")
@@ -371,46 +365,6 @@ def close_position_market(symbol, all_data, equity, reason,
         logger.error(f"Market close {symbol} failed: {e}")
         send_telegram(f"⚠️ <b>Close {symbol} FAILED</b>\n{str(e)[:200]}")
         return False
-
-def _log_maker_close(symbol, fill_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence):
-    logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (MAKER)")
-    clear_peak(symbol)
-    log_trade("CLOSE", symbol, 0, fill_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
-    send_telegram(f"🔴 <b>CLOSE</b> (maker)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
-
-def close_position_maker(symbol, all_data, equity, reason,
-                         cvd_signal="", obi_signal="", oi_signal="", confluence=""):
-    """
-    Discretionary close: try a post-only maker exit first, then FALL BACK to a
-    market close if it doesn't fill — a close must always complete.
-    """
-    pos = get_open_positions().get(symbol)
-    if not pos:
-        logger.warning(f"{symbol}: no position to close")
-        return False
-    is_buy = pos['side'] == "SHORT"
-    size_tokens = abs(pos['size'])
-
-    best_bid, best_ask, tick, decimals = get_testnet_book(symbol)
-    if best_bid is not None:
-        limit_px = best_ask if not is_buy else best_bid
-        limit_px = round(limit_px, decimals)
-        logger.info(f"{symbol} maker close attempt: {size_tokens} @ ${limit_px:.{decimals}f}")
-        status, oid, fpx, fsz, err = place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=True)
-        if status == 'resting':
-            if wait_until(symbol, want_open=False, seconds=MAKER_WAIT_SECONDS):
-                _log_maker_close(symbol, limit_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
-                return True
-            cancel_order(symbol, oid)
-            logger.info(f"{symbol} maker close unfilled — falling back to market")
-        elif status == 'filled':
-            _log_maker_close(symbol, fpx, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
-            return True
-        else:
-            logger.info(f"{symbol} maker close not resting ({status}: {err}) — falling back to market")
-
-    return close_position_market(symbol, all_data, equity, f"{reason} (market fallback)",
-                                 cvd_signal, obi_signal, oi_signal, confluence)
 
 # ─── Chandelier (Trailing ATR) Stop ──────────────────────────────────────────
 
@@ -541,84 +495,7 @@ def check_stops(positions, all_data, equity):
         _save_peaks(peaks)
     return closed_any
 
-# ─── Claude Exit Management ───────────────────────────────────────────────────
-
-def ask_claude_exits(positions, all_data, equity):
-    """
-    Claude's sole job: decide whether to CLOSE, FLIP, or HOLD each open position.
-    It never sees the full symbol universe and cannot open new positions.
-    Entries are handled by the rule-based select_entry().
-    """
-    pos_summary = ""
-    for sym, p in positions.items():
-        data  = all_data.get(sym, {})
-        price = data.get('tn_price') or data.get('price', 0)
-        entry = p['entry']
-        size  = abs(p['size'])
-        side  = p['side']
-        unreal     = _pos_pnl(p, price) if price else 0
-        unreal_pct = (unreal / (size * entry) * 100) if entry and size else 0
-        sign   = "+" if unreal >= 0 else ""
-        st     = data.get('supertrend', {})
-        adx    = data.get('adx', {})
-        rsi_d  = data.get('rsi_60', {})
-        ema_v  = data.get('ema20_60')
-        pct_ema = f"{(price - ema_v) / ema_v * 100:+.1f}%" if ema_v and price else "n/a"
-        cvd    = data.get('cvd', {})
-        obi    = data.get('obi', {})
-        vpin   = data.get('vpin', {})
-        oi     = data.get('oi', {})
-
-        pos_summary += f"""
-{sym} {side} {size} @ ${entry:.4f} | Now ${price:.4f} | P&L: {sign}${unreal:.2f} ({sign}{unreal_pct:.1f}%)
-  Supertrend (daily): {st.get('direction','?').upper()} @ {st.get('value',0):.4f}{' ← JUST FLIPPED' if st.get('changed') else ''}
-  ADX: {adx.get('adx',0):.1f} | +DI {adx.get('plus_di',0):.1f} / -DI {adx.get('minus_di',0):.1f}
-  RSI(60m): {rsi_d.get('rsi',50):.1f} (prev {rsi_d.get('prev_rsi',50):.1f}) | Price vs EMA20: {pct_ema}
-  CVD: {cvd.get('cvd_trend','?')} | {cvd.get('divergence','?')}
-  OBI: {obi.get('obi',0)} | {obi.get('signal','?')}
-  VPIN: {vpin.get('vpin',0)} | {vpin.get('signal','?')}
-  OI: {oi.get('oi_signal','?')} | Funding: {oi.get('funding',0):.4f}% ({oi.get('funding_signal','?')})
-"""
-
-    prompt = f"""You are a professional crypto trading assistant managing open positions on Hyperliquid perps.
-
-Your ONLY job: decide whether to CLOSE, FLIP, or HOLD each open position.
-Entries are handled separately by a rule-based system — do NOT suggest opening new positions.
-
-Account equity: ${equity:.2f} | Leverage: {LEVERAGE}x | Positions: {len(positions)}/{MAX_POSITIONS}
-Chandelier trailing stop ({STOP_ATR_MULT}×ATR from peak) and Supertrend flip exit run automatically.
-
-Open positions:
-{pos_summary}
-
-Exit signals to act on:
-- CVD divergence against position (price up + CVD falling for a long) → CLOSE
-- OBI flipping against position direction → CLOSE
-- VPIN > 0.4 + divergence → informed traders moving against you → CLOSE
-- OI falling while price holds → short-covering rally / weak trend → CLOSE
-- Funding rate strongly against your direction (paying the crowd) → CLOSE or FLIP
-- Daily Supertrend already flipped against your position → FLIP
-- All signals still aligned with position → HOLD
-
-FLIP only on 3+ signal reversal (Supertrend flip + CVD divergence + OBI flip).
-Pick the SINGLE most urgent action, or HOLD if positions look healthy.
-
-Respond in this exact format:
-SYMBOL: asset symbol (or NONE)
-ACTION: CLOSE or FLIP or HOLD
-CVD_SIGNAL: bullish or bearish or neutral
-OBI_SIGNAL: bullish or bearish or neutral
-OI_SIGNAL: bullish or bearish or neutral
-CONFLUENCE: score out of 4
-REASON: one sentence
-"""
-
-    message = claude.messages.create(
-        model="claude-opus-4-8",
-        max_tokens=200,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
+# (Claude exit management removed — exits handled automatically by check_stops)
 
 
 # ─── Rule-Based Entry Selection ───────────────────────────────────────────────
@@ -673,7 +550,7 @@ def select_entry(all_data, positions):
     )
     return best_sym, best_is_long
 
-# ─── Exit Routing ─────────────────────────────────────────────────────────────
+# ─── Entry Conditions ─────────────────────────────────────────────────────────
 
 def _check_pullback_entry(symbol, all_data, action):
     """
@@ -727,73 +604,17 @@ def _check_pullback_entry(symbol, all_data, action):
     return passed, reason
 
 
-def _parse_decision(text):
-    fields = {}
-    for line in text.strip().split("\n"):
-        if ":" in line:
-            key, _, val = line.partition(":")
-            fields[key.strip()] = val.strip()
-    return fields
-
-def execute_exit(decision_text, all_data, equity, positions):
-    """Routes Claude's exit decision (CLOSE / FLIP / HOLD only)."""
-    f = _parse_decision(decision_text)
-    symbol     = f.get("SYMBOL", "")
-    action     = f.get("ACTION", "").upper()
-    cvd_signal = f.get("CVD_SIGNAL", "")
-    obi_signal = f.get("OBI_SIGNAL", "")
-    oi_signal  = f.get("OI_SIGNAL", "")
-    confluence = f.get("CONFLUENCE", "")
-    reason     = f.get("REASON", "")
-
-    logger.info(f"Claude exit: {symbol} {action} | {confluence} | {reason}")
-
-    if action == "HOLD" or symbol in ["NONE", ""]:
-        logger.info("Claude: HOLD — positions look healthy")
-        return False
-
-    if symbol not in all_data:
-        logger.error(f"{symbol} not in market data")
-        return False
-
-    held = positions.get(symbol)
-
-    if action == "CLOSE":
-        if not held:
-            logger.warning(f"{symbol} has no open position to CLOSE")
-            return False
-        return close_position_maker(symbol, all_data, equity, reason,
-                                    cvd_signal, obi_signal, oi_signal, confluence)
-
-    if action == "FLIP":
-        if not held:
-            logger.warning(f"{symbol} no position to FLIP")
-            return False
-        current_side = held['side']
-        logger.info(f"FLIP {symbol}: market-closing {current_side} then maker-opening opposite")
-        if close_position_market(symbol, all_data, equity, f"FLIP close: {reason}",
-                                 cvd_signal, obi_signal, oi_signal, confluence):
-            time.sleep(SETTLE_SECONDS)
-            new_is_buy = current_side == "SHORT"
-            return open_position(symbol, new_is_buy, all_data, equity,
-                                 cvd_signal, obi_signal, oi_signal, confluence,
-                                 f"FLIP open: {reason}")
-        return False
-
-    logger.warning(f"Unexpected action from Claude exit: {action}")
-    return False
-
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 def log_trade(action, symbol, size, price, reason, equity,
-              cvd_signal="", obi_signal="", oi_signal="", confluence=""):
+              cvd_signal="", oi_signal="", confluence=""):
     trades = load_json(TRADE_LOG, [])
     trades.append({
         "timestamp": datetime.now().isoformat(),
         "action": action, "symbol": symbol, "size": size, "price": price,
         "reason": reason, "equity": equity,
-        "cvd_signal": cvd_signal, "obi_signal": obi_signal,
-        "oi_signal": oi_signal, "confluence": confluence,
+        "cvd_signal": cvd_signal, "oi_signal": oi_signal,
+        "confluence": confluence,
         "leverage": LEVERAGE, "notional": size * price
     })
     save_json(TRADE_LOG, trades)
@@ -937,30 +758,18 @@ def run_bot():
                     positions = get_open_positions()
                     equity    = get_equity()
 
-            # ── Step 2: Claude exit management (only if holding positions) ────
-            if positions:
-                logger.info("Asking Claude to review open positions for exits...")
-                exit_decision = ask_claude_exits(positions, all_data, equity)
-                logger.info(f"Claude exit:\n{exit_decision}")
-                exited = execute_exit(exit_decision, all_data, equity, positions)
-                if exited:
-                    time.sleep(SETTLE_SECONDS)
-                    positions = get_open_positions()
-                    equity    = get_equity()
-
-            # ── Step 3: Rule-based entry (only if slot available) ─────────────
+            # ── Step 2: Rule-based entry (only if slot available) ─────────────
             if len(positions) < MAX_POSITIONS:
                 logger.info("Scanning for entry setups...")
                 entry_sym, is_long = select_entry(all_data, positions)
                 if entry_sym:
                     data       = all_data[entry_sym]
                     cvd_signal = data.get('cvd', {}).get('cvd_trend', 'neutral')
-                    obi_signal = data.get('obi', {}).get('signal', 'neutral')
                     oi_signal  = data.get('oi', {}).get('oi_signal', 'stable')
                     adx_val    = data.get('adx', {}).get('adx', 0)
                     open_position(
                         entry_sym, is_long, all_data, equity,
-                        cvd_signal, obi_signal, oi_signal,
+                        cvd_signal, oi_signal,
                         confluence="5/5 rule-based",
                         reason=f"All 5 conditions met (ADX={adx_val:.1f})"
                     )
