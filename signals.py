@@ -1,5 +1,8 @@
 from loguru import logger
-from config import ATR_PERIOD, SUPERTREND_PERIOD, SUPERTREND_MULT, ADX_PERIOD, ADX_THRESHOLD
+from config import (
+    ATR_PERIOD, SUPERTREND_PERIOD, SUPERTREND_MULT, ADX_PERIOD, ADX_THRESHOLD,
+    RSI_PERIOD, RSI_LOOKBACK, EMA_PERIOD,
+)
 
 
 def compute_daily_vol(candles):
@@ -229,6 +232,60 @@ def compute_adx(candles, period=ADX_PERIOD):
         return {"adx": adx, "plus_di": pdi, "minus_di": mdi, "trending": adx > ADX_THRESHOLD}
     except Exception:
         return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
+
+
+def compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK):
+    """
+    Wilder's RSI on 60-min close prices.
+    Returns current RSI, previous-bar RSI, and the min/max RSI over the last `lookback` bars
+    so callers can detect a recent dip below / spike above a threshold.
+    """
+    try:
+        closes = [float(c['c']) for c in candles]
+        if len(closes) < period + 2:
+            return {"rsi": 50.0, "prev_rsi": 50.0, "min_recent": 50.0, "max_recent": 50.0}
+
+        changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains   = [max(ch, 0.0) for ch in changes]
+        losses  = [max(-ch, 0.0) for ch in changes]
+
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        rsi_series = []
+        for i in range(period, len(changes)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            rs = avg_gain / avg_loss if avg_loss > 0 else 100.0
+            rsi_series.append(100.0 - 100.0 / (1.0 + rs))
+
+        if len(rsi_series) < 2:
+            return {"rsi": 50.0, "prev_rsi": 50.0, "min_recent": 50.0, "max_recent": 50.0}
+
+        recent = rsi_series[-lookback:] if len(rsi_series) >= lookback else rsi_series
+        return {
+            "rsi":        round(rsi_series[-1], 2),
+            "prev_rsi":   round(rsi_series[-2], 2),
+            "min_recent": round(min(recent), 2),
+            "max_recent": round(max(recent), 2),
+        }
+    except Exception:
+        return {"rsi": 50.0, "prev_rsi": 50.0, "min_recent": 50.0, "max_recent": 50.0}
+
+
+def compute_ema(candles, period=EMA_PERIOD):
+    """Standard EMA of close prices seeded with SMA over the first `period` bars."""
+    try:
+        closes = [float(c['c']) for c in candles]
+        if len(closes) < period:
+            return None
+        k = 2.0 / (period + 1)
+        ema = sum(closes[:period]) / period
+        for close in closes[period:]:
+            ema = close * k + ema * (1.0 - k)
+        return round(ema, 6)
+    except Exception:
+        return None
 
 
 def compute_oi(symbol, candles, price, info):

@@ -27,5 +27,13 @@ SUPERTREND_MULT = 3.0
 ADX_PERIOD = 14
 ADX_THRESHOLD = 25
 
+RSI_PERIOD = 14
+RSI_LONG_THRESHOLD = 40   # longs: wait for RSI dip below this
+RSI_SHORT_THRESHOLD = 60  # shorts: wait for RSI spike above this
+RSI_LOOKBACK = 5          # bars to look back for a dip/spike
+
+EMA_PERIOD = 20
+EMA_BAND_PCT = 0.02       # price within ±2% of EMA counts as "near"
+
 TRADE_LOG = "data/trades.json"
 EQUITY_LOG = "data/equity_curve.json"

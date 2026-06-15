@@ -12,11 +12,13 @@ from config import (
     VOL_TARGET_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
     TRADE_LOG, EQUITY_LOG, SUPERTREND_PERIOD, SUPERTREND_MULT,
     ADX_PERIOD, ADX_THRESHOLD,
+    RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
+    EMA_PERIOD, EMA_BAND_PCT,
 )
 from notify import send_telegram
 from signals import (
     compute_daily_vol, compute_atr, compute_cvd, compute_obi, compute_vpin,
-    compute_oi, compute_supertrend, compute_adx,
+    compute_oi, compute_supertrend, compute_adx, compute_rsi, compute_ema,
 )
 from exchange import (
     mainnet_info, exchange as hl_exchange,
@@ -164,6 +166,8 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "oi": compute_oi(symbol, candles, price, mainnet_info),
                 "supertrend": supertrend,
                 "adx": adx,
+                "rsi_60": compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK),
+                "ema20_60": compute_ema(candles, period=EMA_PERIOD),
             }
         except Exception as e:
             if attempt < max_retries:
@@ -209,10 +213,15 @@ def get_all_market_data(symbols, open_position_syms=None):
         adx = data['adx']
         st_tag  = f"ST={st['direction'].upper()}" + (" [FLIP]" if st['changed'] else "")
         adx_tag = f"ADX={adx['adx']:.1f}" + (" ✓" if adx['trending'] else " ✗chop")
+        rsi_d = data.get('rsi_60', {})
+        ema_v = data.get('ema20_60')
+        rsi_tag = f"RSI={rsi_d.get('rsi', 0):.1f}(min{rsi_d.get('min_recent',0):.1f}/max{rsi_d.get('max_recent',0):.1f})"
+        ema_tag = f"EMA20=${ema_v:.4f}" if ema_v else "EMA20=n/a"
         logger.info(
             f"  {sym}: testnet ${data['tn_price']:.4f} | DailyVol={vol_str} | "
             f"OI=${data['oi']['oi_usd']:,.0f} | CVD={data['cvd']['cvd_trend']} | "
-            f"OBI={data['obi']['obi']} | Funding={data['oi']['funding']}% | {st_tag} | {adx_tag}"
+            f"OBI={data['obi']['obi']} | Funding={data['oi']['funding']}% | {st_tag} | {adx_tag} | "
+            f"{rsi_tag} | {ema_tag}"
         )
 
     if failed:
@@ -449,10 +458,36 @@ def ask_claude(all_data, equity, positions):
         adx = data['adx']
         st_flip  = " ← TREND JUST FLIPPED" if st['changed'] else ""
         adx_gate = f"TRENDING — eligible (ADX {adx['adx']:.1f} > {ADX_THRESHOLD})" if adx['trending'] else f"CHOPPY — no entry (ADX {adx['adx']:.1f} ≤ {ADX_THRESHOLD})"
+        rsi_d  = data.get('rsi_60', {})
+        ema_v  = data.get('ema20_60')
+        price  = data.get('tn_price') or data.get('price', 0)
+        rsi    = rsi_d.get('rsi', 50.0)
+        p_rsi  = rsi_d.get('prev_rsi', 50.0)
+        min_r  = rsi_d.get('min_recent', 50.0)
+        max_r  = rsi_d.get('max_recent', 50.0)
+        ema_str = f"${ema_v:.4f}" if ema_v else "n/a"
+        if ema_v and price:
+            pct_ema = (price - ema_v) / ema_v * 100
+            pct_str = f"{pct_ema:+.1f}%"
+            near_ema = abs(pct_ema) <= EMA_BAND_PCT * 100
+        else:
+            pct_str = "n/a"; near_ema = False
+        c2_long  = min_r < RSI_LONG_THRESHOLD
+        c2_short = max_r > RSI_SHORT_THRESHOLD
+        c4_long  = rsi > p_rsi
+        c4_short = rsi < p_rsi
+        long_ready  = c2_long  and near_ema and c4_long
+        short_ready = c2_short and near_ema and c4_short
+
         market_summary += f"""
 {symbol} (${data['price']:.4f}) [{pos_str}] | 24h Vol: ${data['oi']['day_volume']:,.0f} | Daily vol: {vol_str}:
   Supertrend (daily, ATR {SUPERTREND_PERIOD}, ×{SUPERTREND_MULT}): {st['direction'].upper()} @ {st['value']:.4f}{st_flip}
   ADX (daily, {ADX_PERIOD}): {adx['adx']:.1f} | +DI {adx['plus_di']:.1f} / -DI {adx['minus_di']:.1f} | {adx_gate}
+  60-min pullback (RSI {RSI_PERIOD} / EMA {EMA_PERIOD}):
+    RSI={rsi:.1f} (1h ago: {p_rsi:.1f}) | {RSI_LOOKBACK}-bar range: [{min_r:.1f}–{max_r:.1f}]
+    20-EMA={ema_str} | Price {pct_str} from EMA
+    Long  C2+C3+C4: dip<{RSI_LONG_THRESHOLD}={'✓' if c2_long else '✗'} | near EMA={'✓' if near_ema else '✗'} | hook↑={'✓' if c4_long else '✗'} → {'SETUP READY ✅' if long_ready else 'waiting'}
+    Short C2+C3+C4: spike>{RSI_SHORT_THRESHOLD}={'✓' if c2_short else '✗'} | near EMA={'✓' if near_ema else '✗'} | hook↓={'✓' if c4_short else '✗'} → {'SETUP READY ✅' if short_ready else 'waiting'}
   Candles (last 10h):
 {data['candle_summary']}
   Orderflow:
@@ -500,6 +535,13 @@ Signal interpretation guide:
     ADX > {ADX_THRESHOLD} = trending, entries allowed. ADX ≤ {ADX_THRESHOLD} = choppy, no new entries.
     When multiple symbols have ADX > {ADX_THRESHOLD}, pick the one with the HIGHEST ADX — strongest trend wins.
     +DI > -DI = bullish momentum. -DI > +DI = bearish momentum (confirms direction).
+- PULLBACK ENTRY (60-min) — enforced as a HARD FILTER, all 3 conditions must be met:
+    C2: RSI({RSI_PERIOD}) dipped below {RSI_LONG_THRESHOLD} in the last {RSI_LOOKBACK} bars (longs) / spiked above {RSI_SHORT_THRESHOLD} (shorts).
+        Trend-adjusted thresholds — in a strong trend, overbought/oversold comes earlier.
+    C3: Price within ±{EMA_BAND_PCT*100:.0f}% of the 20-EMA on 60-min — pulled back to support, not collapsed through.
+    C4: RSI is now hooking back up (longs: RSI > prior bar RSI) / down (shorts) — confirming trend resumption.
+    When a symbol shows "SETUP READY ✅", it is the highest-priority pick for an entry.
+    If no symbol has a ready setup, HOLD — do not force an entry.
 - CVD rising = buyers in control (bullish). Falling = sellers (bearish).
 - CVD divergence: price up + CVD down = bearish reversal risk. Price down + CVD up = bullish reversal.
 - OBI >+0.3 = bullish (bid heavy), <-0.3 = bearish (ask heavy), near 0 = neutral.
@@ -510,8 +552,8 @@ Signal interpretation guide:
 - High positive funding = crowded longs, squeeze/reversal down risk → favors SHORT.
 - High negative funding = crowded shorts, squeeze up risk → favors LONG.
 
-LONG setup (OPEN_LONG): Supertrend BULLISH + CVD rising + OBI bullish + OI rising + funding neutral/negative
-SHORT setup (OPEN_SHORT): Supertrend BEARISH + CVD falling + OBI bearish + OI rising + funding neutral/positive
+LONG setup (OPEN_LONG): Supertrend BULLISH + ADX > {ADX_THRESHOLD} + RSI dipped <{RSI_LONG_THRESHOLD} + near 20-EMA + RSI hooking up + CVD/OBI/OI confirming
+SHORT setup (OPEN_SHORT): Supertrend BEARISH + ADX > {ADX_THRESHOLD} + RSI spiked >{RSI_SHORT_THRESHOLD} + near 20-EMA + RSI hooking down + CVD/OBI/OI confirming
 Strong reversal where you already hold the wrong side → FLIP
 
 Available actions:
@@ -549,6 +591,58 @@ REASON: one sentence explaining the directional orderflow confluence
     return message.content[0].text
 
 # ─── Decision Routing ─────────────────────────────────────────────────────────
+
+def _check_pullback_entry(symbol, all_data, action):
+    """
+    Validates pullback conditions C2–C4 for OPEN_LONG / OPEN_SHORT.
+    C2: RSI dipped below RSI_LONG_THRESHOLD (long) or spiked above RSI_SHORT_THRESHOLD (short)
+        within the last RSI_LOOKBACK bars.
+    C3: Price is within EMA_BAND_PCT of the 20-EMA on 60-min.
+    C4: RSI is now hooking back in the direction of the trade (up for long, down for short).
+    Returns (passed: bool, reason: str).
+    """
+    data     = all_data[symbol]
+    rsi_data = data.get('rsi_60', {})
+    ema_val  = data.get('ema20_60')
+    price    = data.get('tn_price') or data.get('price', 0)
+
+    rsi      = rsi_data.get('rsi', 50.0)
+    prev_rsi = rsi_data.get('prev_rsi', 50.0)
+
+    if ema_val and price:
+        pct_from_ema = abs(price - ema_val) / ema_val
+        near_ema = pct_from_ema <= EMA_BAND_PCT
+        pct_str  = f"{(price - ema_val) / ema_val * 100:+.1f}%"
+    else:
+        near_ema = False
+        pct_str  = "n/a"
+    ema_str = f"${ema_val:.4f}" if ema_val else "n/a"
+
+    if action == "OPEN_LONG":
+        c2 = rsi_data.get('min_recent', 50.0) < RSI_LONG_THRESHOLD
+        c3 = near_ema
+        c4 = rsi > prev_rsi
+        passed = c2 and c3 and c4
+        reason = (
+            f"C2(dip<{RSI_LONG_THRESHOLD})={'✓' if c2 else '✗'}[min={rsi_data.get('min_recent',50):.1f}] "
+            f"C3(near EMA {ema_str} {pct_str})={'✓' if c3 else '✗'} "
+            f"C4(hook↑ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'}"
+        )
+    elif action == "OPEN_SHORT":
+        c2 = rsi_data.get('max_recent', 50.0) > RSI_SHORT_THRESHOLD
+        c3 = near_ema
+        c4 = rsi < prev_rsi
+        passed = c2 and c3 and c4
+        reason = (
+            f"C2(spike>{RSI_SHORT_THRESHOLD})={'✓' if c2 else '✗'}[max={rsi_data.get('max_recent',50):.1f}] "
+            f"C3(near EMA {ema_str} {pct_str})={'✓' if c3 else '✗'} "
+            f"C4(hook↓ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'}"
+        )
+    else:
+        return True, ""
+
+    return passed, reason
+
 
 def _parse_decision(text):
     fields = {}
@@ -601,6 +695,10 @@ def execute_decision(decision_text, all_data, equity, positions):
         adx_data = all_data[symbol].get('adx', {})
         if not adx_data.get('trending', False):
             logger.info(f"{symbol} {action} blocked — ADX {adx_data.get('adx', 0):.1f} ≤ {ADX_THRESHOLD} (choppy, no trend)")
+            return False
+        passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
+        if not passed:
+            logger.info(f"{symbol} {action} blocked — pullback: {pb_reason}")
             return False
         return open_position(symbol, action == "OPEN_LONG", all_data, equity,
                              cvd_signal, obi_signal, oi_signal, confluence, reason)
