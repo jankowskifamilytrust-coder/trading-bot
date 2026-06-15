@@ -248,6 +248,27 @@ def compute_ema(candles, period=EMA_PERIOD):
         return None
 
 
+def compute_volume_ratio(candles, lookback=10):
+    """Ratio of current bar volume to the previous lookback-bar average."""
+    try:
+        vols = [float(c['v']) for c in candles]
+        if len(vols) < lookback + 1:
+            return 1.0
+        avg = sum(vols[-(lookback + 1):-1]) / lookback
+        return round(vols[-1] / avg, 3) if avg > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def compute_struct_stops(candles, lookback=5):
+    """Swing low/high over the recent lookback bars for structural stop placement."""
+    try:
+        recent = candles[-lookback:]
+        return min(float(c['l']) for c in recent), max(float(c['h']) for c in recent)
+    except Exception:
+        return None, None
+
+
 def compute_oi(symbol, candles, price, info):
     try:
         asset_contexts = info.meta_and_asset_ctxs()

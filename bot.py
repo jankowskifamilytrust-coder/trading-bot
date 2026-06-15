@@ -1,6 +1,7 @@
 import os
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dotenv import load_dotenv
 from loguru import logger
@@ -13,11 +14,14 @@ from config import (
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_PERIOD, EMA_BAND_PCT,
+    FUNDING_LONG_MAX, FUNDING_SHORT_MIN, ADX_CVD_BOOST, ADX_DECAY_EXIT,
+    VOLUME_CONFIRM_RATIO, MAX_HOLD_HOURS, STRUCT_STOP_BUFFER,
 )
 from notify import send_telegram
 from signals import (
     compute_daily_vol, compute_atr, compute_cvd,
     compute_oi, compute_supertrend, compute_adx, compute_rsi, compute_ema,
+    compute_volume_ratio, compute_struct_stops,
 )
 from exchange import (
     mainnet_info, exchange as hl_exchange,
@@ -149,6 +153,24 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 supertrend = {"direction": "neutral", "value": 0.0, "changed": False}
                 adx = {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
 
+            # 4h candles — intermediate timeframe filter
+            try:
+                h4_end = int(time.time() * 1000)
+                h4_start = h4_end - (30 * 24 * 60 * 60 * 1000)
+                candles_4h = mainnet_info.candles_snapshot(symbol, "4h", h4_start, h4_end)
+                rsi_4h = compute_rsi(candles_4h, period=RSI_PERIOD, lookback=3)
+                ema_4h_now  = compute_ema(candles_4h, period=EMA_PERIOD)
+                ema_4h_prev = compute_ema(candles_4h[:-3], period=EMA_PERIOD) \
+                              if len(candles_4h) > EMA_PERIOD + 3 else None
+                if ema_4h_now and ema_4h_prev:
+                    ema_4h_slope = "up" if ema_4h_now > ema_4h_prev else "down"
+                else:
+                    ema_4h_slope = "unknown"
+            except Exception as e:
+                logger.warning(f"{symbol}: 4h candle fetch failed: {e}")
+                rsi_4h = {"rsi": 50.0, "prev_rsi": 50.0, "min_recent": 50.0, "max_recent": 50.0}
+                ema_4h_slope = "unknown"
+
             return {
                 "symbol": symbol, "price": price,
                 "tn_price": price,
@@ -162,6 +184,10 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "adx": adx,
                 "rsi_60": compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK),
                 "ema20_60": compute_ema(candles, period=EMA_PERIOD),
+                "vol_ratio_60": compute_volume_ratio(candles, lookback=10),
+                "struct_stops": compute_struct_stops(candles, lookback=RSI_LOOKBACK),
+                "rsi_4h": rsi_4h,
+                "ema_4h_slope": ema_4h_slope,
             }
         except Exception as e:
             if attempt < max_retries:
@@ -173,16 +199,22 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
 
 def get_all_market_data(symbols, open_position_syms=None):
     open_position_syms = open_position_syms or set()
-    logger.info("Fetching market data + orderflow for selected symbols...")
+    logger.info("Fetching market data + orderflow for selected symbols (parallel)...")
     all_data = {}
     failed = []
-    for symbol in symbols:
-        data = get_symbol_data(symbol, max_retries=3, retry_delay=5)
-        if data:
-            all_data[symbol] = data
-        else:
-            failed.append(symbol)
-        time.sleep(0.5)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(get_symbol_data, sym, 3, 5): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                data = future.result()
+                if data:
+                    all_data[sym] = data
+                else:
+                    failed.append(sym)
+            except Exception as e:
+                logger.error(f"{sym} fetch error: {e}")
+                failed.append(sym)
 
     tn_prices = get_testnet_price_map()
     wide_gap = []
@@ -211,11 +243,14 @@ def get_all_market_data(symbols, open_position_syms=None):
         ema_v = data.get('ema20_60')
         rsi_tag = f"RSI={rsi_d.get('rsi', 0):.1f}(min{rsi_d.get('min_recent',0):.1f}/max{rsi_d.get('max_recent',0):.1f})"
         ema_tag = f"EMA20=${ema_v:.4f}" if ema_v else "EMA20=n/a"
+        rsi4_val = data.get('rsi_4h', {}).get('rsi', 0)
+        slope_tag = data.get('ema_4h_slope', '?')
+        vol_r = data.get('vol_ratio_60', 1.0)
         logger.info(
             f"  {sym}: testnet ${data['tn_price']:.4f} | DailyVol={vol_str} | "
             f"OI=${data['oi']['oi_usd']:,.0f} | CVD={data['cvd']['cvd_trend']} | "
             f"Funding={data['oi']['funding']}% | {st_tag} | {adx_tag} | "
-            f"{rsi_tag} | {ema_tag}"
+            f"{rsi_tag} | {ema_tag} | 4hRSI={rsi4_val:.1f} slope={slope_tag} | VolRatio={vol_r:.2f}"
         )
 
     if failed:
@@ -282,9 +317,12 @@ def open_position(symbol, is_buy, all_data, equity,
 
         status, oid, fpx, fsz, err = place_alo_limit(symbol, is_buy, size_tokens, limit_px)
 
+        sym_data = all_data.get(symbol, {})
+
         if status == 'filled':
             return _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
-                                  cvd_signal, oi_signal, confluence, reason, equity)
+                                  cvd_signal, oi_signal, confluence, reason, equity,
+                                  sym_data=sym_data)
 
         if status == 'rejected':
             logger.info(f"{symbol} {tag} ALO rejected (would cross / {err}) — trying next")
@@ -299,7 +337,8 @@ def open_position(symbol, is_buy, all_data, equity,
         filled = wait_until(symbol, want_open=True, seconds=MAKER_WAIT_SECONDS)
         if filled:
             return _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
-                                  cvd_signal, oi_signal, confluence, reason, equity)
+                                  cvd_signal, oi_signal, confluence, reason, equity,
+                                  sym_data=sym_data)
         cancel_order(symbol, oid)
         logger.info(f"{symbol} {tag} maker order unfilled in {MAKER_WAIT_SECONDS}s")
 
@@ -308,14 +347,25 @@ def open_position(symbol, is_buy, all_data, equity,
     return False
 
 def _finalize_open(symbol, direction, is_buy, notional_usd, daily_vol,
-                   cvd_signal, oi_signal, confluence, reason, equity):
+                   cvd_signal, oi_signal, confluence, reason, equity, sym_data=None):
     pos = get_open_positions().get(symbol)
     fill_px = pos['entry'] if pos else 0
     fill_sz = abs(pos['size']) if pos else 0
     logger.success(f"✅ OPEN {direction} {symbol}: {fill_sz} @ ${fill_px:.4f} (MAKER) | "
                    f"Notional: ${notional_usd:.2f} | Confluence: {confluence}")
+
+    # Compute structural stop from swing low/high over the RSI lookback window
+    struct_stop = None
+    if sym_data and fill_px:
+        atr_val = sym_data.get('atr')
+        sw_low, sw_high = sym_data.get('struct_stops', (None, None))
+        if atr_val:
+            if is_buy and sw_low and sw_low < fill_px:
+                struct_stop = sw_low - STRUCT_STOP_BUFFER * atr_val
+            elif not is_buy and sw_high and sw_high > fill_px:
+                struct_stop = sw_high + STRUCT_STOP_BUFFER * atr_val
     if fill_px:
-        init_peak(symbol, fill_px)
+        init_peak(symbol, fill_px, struct_stop=struct_stop)
     action_label = "BUY" if is_buy else "SELL"
     log_trade(action_label, symbol, fill_sz, fill_px, reason, equity,
               cvd_signal, oi_signal, confluence)
@@ -369,16 +419,30 @@ def close_position_market(symbol, all_data, equity, reason,
 # ─── Chandelier (Trailing ATR) Stop ──────────────────────────────────────────
 
 def _load_peaks():
-    return load_json(TRAILING_STOP_LOG, {})
+    raw = load_json(TRAILING_STOP_LOG, {})
+    # Migrate old flat format {sym: float} → {sym: {"peak": float, ...}}
+    migrated = False
+    for sym, val in raw.items():
+        if isinstance(val, (int, float)):
+            raw[sym] = {"peak": float(val), "opened_at": None, "struct_stop": None}
+            migrated = True
+    if migrated:
+        save_json(TRAILING_STOP_LOG, raw)
+    return raw
 
 def _save_peaks(peaks):
     save_json(TRAILING_STOP_LOG, peaks)
 
-def init_peak(symbol, entry_price):
+def init_peak(symbol, entry_price, struct_stop=None):
     peaks = _load_peaks()
-    peaks[symbol] = entry_price
+    peaks[symbol] = {
+        "peak": entry_price,
+        "opened_at": datetime.now().isoformat(),
+        "struct_stop": struct_stop,
+    }
     _save_peaks(peaks)
-    logger.info(f"Chandelier {symbol}: peak initialised at ${entry_price:.4f}")
+    extra = f" | struct stop ${struct_stop:.4f}" if struct_stop is not None else ""
+    logger.info(f"Chandelier {symbol}: peak initialised at ${entry_price:.4f}{extra}")
 
 def clear_peak(symbol):
     peaks = _load_peaks()
@@ -389,16 +453,16 @@ def clear_peak(symbol):
 
 def check_stops(positions, all_data, equity):
     """
-    Two exit triggers, evaluated in order:
+    Four exit triggers, evaluated in order per position:
 
-    1. Supertrend flip exit — if the daily Supertrend flips against the
-       position direction on this candle, close immediately (market order).
-       Catches trend reversals before the chandelier can react.
-
-    2. Chandelier (trailing ATR) stop with break-even lock —
-       stop = peak ± STOP_ATR_MULT × ATR, peak ratchets in the profitable
-       direction only. Once profit ≥ 1×ATR, the peak is floored so the stop
-       never falls below entry (break-even lock).
+    1. Supertrend flip — daily ST flips against position direction → market close.
+    2. ADX decay — ADX drops below ADX_DECAY_EXIT → trend is dead, close.
+    3. Time exit — held > MAX_HOLD_HOURS without reaching break-even → close.
+    4. Chandelier trailing stop with break-even lock + structural floor.
+       stop = peak ± STOP_ATR_MULT × ATR; at break-even the peak is floored
+       so the stop never retreats below entry. The structural stop (swing
+       low/high ± STRUCT_STOP_BUFFER × ATR) acts as the minimum stop floor
+       in the early part of the trade before the chandelier catches up.
     """
     peaks = _load_peaks()
     peaks_changed = False
@@ -437,40 +501,92 @@ def check_stops(positions, all_data, equity):
                     peaks.pop(sym, None)
                     closed_any = True
                     time.sleep(1)
-                continue  # skip chandelier for this symbol
+                continue
 
-        # ── 2. Chandelier stop with break-even lock ───────────────────────────
+        # ── 2. ADX decay exit ─────────────────────────────────────────────────
+        adx_val = data.get('adx', {}).get('adx', 0.0)
+        if adx_val < ADX_DECAY_EXIT:
+            logger.warning(
+                f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
+            )
+            send_telegram(
+                f"📉 <b>ADX DECAY EXIT {sym} {side}</b>\n"
+                f"ADX={adx_val:.1f} dropped below {ADX_DECAY_EXIT} — trend exhausted"
+            )
+            if close_position_market(sym, all_data, equity,
+                                     f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
+                clear_peak(sym)
+                peaks.pop(sym, None)
+                closed_any = True
+                time.sleep(1)
+            continue
+
+        # Ensure peak entry exists in new dict format
         if sym not in peaks:
-            peaks[sym] = entry
+            peaks[sym] = {"peak": entry, "opened_at": None, "struct_stop": None}
             peaks_changed = True
 
-        peak          = peaks[sym]
+        peak_data     = peaks[sym]
+        peak          = peak_data["peak"]
+        opened_at     = peak_data.get("opened_at")
+        struct_stop   = peak_data.get("struct_stop")
         stop_distance = STOP_ATR_MULT * atr
 
+        # ── 3. Time exit (no break-even after MAX_HOLD_HOURS) ─────────────────
+        if opened_at:
+            try:
+                hours_held = (datetime.now() - datetime.fromisoformat(opened_at)).total_seconds() / 3600
+                be_reached = (side == "LONG"  and peak >= entry + stop_distance) or \
+                             (side == "SHORT" and peak <= entry - stop_distance)
+                if hours_held > MAX_HOLD_HOURS and not be_reached:
+                    logger.warning(
+                        f"⏱ TIME EXIT {sym} {side}: held {hours_held:.1f}h without break-even"
+                    )
+                    send_telegram(
+                        f"⏱ <b>TIME EXIT {sym} {side}</b>\n"
+                        f"Held {hours_held:.1f}h without reaching break-even"
+                    )
+                    if close_position_market(sym, all_data, equity,
+                                             f"Time exit ({hours_held:.1f}h, no break-even)"):
+                        clear_peak(sym)
+                        peaks.pop(sym, None)
+                        closed_any = True
+                        time.sleep(1)
+                    continue
+            except Exception as e:
+                logger.debug(f"Time exit check for {sym} failed: {e}")
+
+        # ── 4. Chandelier stop + structural floor ─────────────────────────────
         if side == "LONG":
             new_peak = max(peak, price)
-            # Break-even: profit ≥ 1×ATR → floor peak so stop ≥ entry
             if price - entry >= atr:
                 new_peak = max(new_peak, entry + stop_distance)
-            stop_price = new_peak - stop_distance
+            chandelier_stop = new_peak - stop_distance
+            if struct_stop is not None and struct_stop < entry:
+                chandelier_stop = max(chandelier_stop, struct_stop)
+            stop_price = chandelier_stop
             breached   = price <= stop_price
         else:
             new_peak = min(peak, price)
             if entry - price >= atr:
                 new_peak = min(new_peak, entry - stop_distance)
-            stop_price = new_peak + stop_distance
+            chandelier_stop = new_peak + stop_distance
+            if struct_stop is not None and struct_stop > entry:
+                chandelier_stop = min(chandelier_stop, struct_stop)
+            stop_price = chandelier_stop
             breached   = price >= stop_price
 
         if new_peak != peak:
-            peaks[sym] = new_peak
+            peaks[sym]["peak"] = new_peak
             peaks_changed = True
 
-        be_active = (side == "LONG" and new_peak >= entry + stop_distance) or \
-                    (side == "SHORT" and new_peak <= entry - stop_distance)
-        be_tag = " [BE]" if be_active else ""
+        be_active  = (side == "LONG"  and new_peak >= entry + stop_distance) or \
+                     (side == "SHORT" and new_peak <= entry - stop_distance)
+        be_tag     = " [BE]" if be_active else ""
+        struct_tag = f" | struct=${struct_stop:.4f}" if struct_stop else ""
         logger.debug(
             f"Chandelier {sym} {side}: entry=${entry:.4f} peak=${new_peak:.4f} "
-            f"stop=${stop_price:.4f}{be_tag} | now=${price:.4f}"
+            f"stop=${stop_price:.4f}{be_tag}{struct_tag} | now=${price:.4f}"
         )
 
         if breached:
@@ -523,9 +639,24 @@ def select_entry(all_data, positions):
         is_long = (st_dir == 'bullish')
         action  = "OPEN_LONG" if is_long else "OPEN_SHORT"
 
-        adx_data = data.get('adx', {})
-        if not adx_data.get('trending', False):
-            logger.debug(f"  {symbol}: ADX {adx_data.get('adx',0):.1f} ≤ {ADX_THRESHOLD} — skip")
+        # Funding gate — skip crowded-side entries
+        funding = data.get('oi', {}).get('funding', 0.0)
+        if is_long and funding > FUNDING_LONG_MAX:
+            logger.debug(f"  {symbol}: funding {funding:.4f}% > {FUNDING_LONG_MAX}% — skip long (crowded)")
+            continue
+        if not is_long and funding < FUNDING_SHORT_MIN:
+            logger.debug(f"  {symbol}: funding {funding:.4f}% < {FUNDING_SHORT_MIN}% — skip short (crowded)")
+            continue
+
+        # ADX gate — raise threshold when CVD disagrees with direction
+        adx_data  = data.get('adx', {})
+        adx_val   = adx_data.get('adx', 0.0)
+        cvd_trend = data.get('cvd', {}).get('cvd_trend', 'neutral')
+        cvd_agrees  = (is_long and cvd_trend == 'rising') or (not is_long and cvd_trend == 'falling')
+        required_adx = ADX_THRESHOLD if cvd_agrees else ADX_CVD_BOOST
+        if adx_val < required_adx:
+            label = "agrees" if cvd_agrees else f"disagrees → need {ADX_CVD_BOOST}"
+            logger.debug(f"  {symbol}: ADX {adx_val:.1f} < {required_adx} (CVD {label}) — skip")
             continue
 
         passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
@@ -533,7 +664,6 @@ def select_entry(all_data, positions):
             logger.debug(f"  {symbol} {action}: pullback not ready — {pb_reason}")
             continue
 
-        adx_val = adx_data.get('adx', 0.0)
         logger.info(f"  {symbol} {action}: SETUP READY — ADX={adx_val:.1f} | {pb_reason}")
         candidates.append((symbol, is_long, adx_val))
 
@@ -554,20 +684,26 @@ def select_entry(all_data, positions):
 
 def _check_pullback_entry(symbol, all_data, action):
     """
-    Validates pullback conditions C2–C4 for OPEN_LONG / OPEN_SHORT.
+    Validates pullback conditions C0–C5 for OPEN_LONG / OPEN_SHORT.
+    C0: 4h RSI > 50 and 4h EMA slope is in trade direction (intermediate filter).
     C2: RSI dipped below RSI_LONG_THRESHOLD (long) or spiked above RSI_SHORT_THRESHOLD (short)
         within the last RSI_LOOKBACK bars.
     C3: Price is within EMA_BAND_PCT of the 20-EMA on 60-min.
-    C4: RSI is now hooking back in the direction of the trade (up for long, down for short).
+    C4: RSI is now hooking back in the direction of the trade.
+    C5: Current bar volume ≥ VOLUME_CONFIRM_RATIO × 10-bar average (volume confirmation).
     Returns (passed: bool, reason: str).
     """
-    data     = all_data[symbol]
-    rsi_data = data.get('rsi_60', {})
-    ema_val  = data.get('ema20_60')
-    price    = data.get('tn_price') or data.get('price', 0)
+    data      = all_data[symbol]
+    rsi_data  = data.get('rsi_60', {})
+    ema_val   = data.get('ema20_60')
+    price     = data.get('tn_price') or data.get('price', 0)
+    rsi_4h    = data.get('rsi_4h', {})
+    slope     = data.get('ema_4h_slope', 'unknown')
+    vol_ratio = data.get('vol_ratio_60', 1.0)
 
     rsi      = rsi_data.get('rsi', 50.0)
     prev_rsi = rsi_data.get('prev_rsi', 50.0)
+    rsi_4h_v = rsi_4h.get('rsi', 50.0)
 
     if ema_val and price:
         pct_from_ema = abs(price - ema_val) / ema_val
@@ -578,25 +714,33 @@ def _check_pullback_entry(symbol, all_data, action):
         pct_str  = "n/a"
     ema_str = f"${ema_val:.4f}" if ema_val else "n/a"
 
+    c5 = vol_ratio >= VOLUME_CONFIRM_RATIO
+
     if action == "OPEN_LONG":
+        c0 = (rsi_4h_v > 50) and (slope == "up")
         c2 = rsi_data.get('min_recent', 50.0) < RSI_LONG_THRESHOLD
         c3 = near_ema
         c4 = rsi > prev_rsi
-        passed = c2 and c3 and c4
+        passed = c0 and c2 and c3 and c4 and c5
         reason = (
+            f"C0(4hRSI={rsi_4h_v:.1f}>50,slope={slope})={'✓' if c0 else '✗'} "
             f"C2(dip<{RSI_LONG_THRESHOLD})={'✓' if c2 else '✗'}[min={rsi_data.get('min_recent',50):.1f}] "
             f"C3(near EMA {ema_str} {pct_str})={'✓' if c3 else '✗'} "
-            f"C4(hook↑ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'}"
+            f"C4(hook↑ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'} "
+            f"C5(vol={vol_ratio:.2f}≥{VOLUME_CONFIRM_RATIO})={'✓' if c5 else '✗'}"
         )
     elif action == "OPEN_SHORT":
+        c0 = (rsi_4h_v < 50) and (slope == "down")
         c2 = rsi_data.get('max_recent', 50.0) > RSI_SHORT_THRESHOLD
         c3 = near_ema
         c4 = rsi < prev_rsi
-        passed = c2 and c3 and c4
+        passed = c0 and c2 and c3 and c4 and c5
         reason = (
+            f"C0(4hRSI={rsi_4h_v:.1f}<50,slope={slope})={'✓' if c0 else '✗'} "
             f"C2(spike>{RSI_SHORT_THRESHOLD})={'✓' if c2 else '✗'}[max={rsi_data.get('max_recent',50):.1f}] "
             f"C3(near EMA {ema_str} {pct_str})={'✓' if c3 else '✗'} "
-            f"C4(hook↓ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'}"
+            f"C4(hook↓ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'} "
+            f"C5(vol={vol_ratio:.2f}≥{VOLUME_CONFIRM_RATIO})={'✓' if c5 else '✗'}"
         )
     else:
         return True, ""
@@ -722,7 +866,7 @@ def run_bot():
     logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 24h dollar volume")
     logger.info(f"Pinned symbols: {', '.join(PINNED)}")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
-    logger.info(f"Exits: chandelier trailing stop + Supertrend flip (automatic) + Claude (discretionary)")
+    logger.info(f"Exits: ST flip | ADX decay <{ADX_DECAY_EXIT} | time >{MAX_HOLD_HOURS}h | chandelier {STOP_ATR_MULT}×ATR + struct stop")
     logger.info(f"Sizing: VOL-TARGETED {VOL_TARGET_PCT*100:.0f}% daily risk, cap ${MAX_NOTIONAL_USD} notional")
     logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +1×ATR")
     logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS} | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
@@ -734,7 +878,7 @@ def run_bot():
         "🤖 <b>Trading Bot Started</b>\n"
         f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max {MAX_POSITIONS}\n"
         f"Entries: rule-based (ST + ADX + pullback) | Post-only maker\n"
-        f"Exits: chandelier {STOP_ATR_MULT}×ATR + ST flip + Claude\n"
+        f"Exits: ST flip | ADX decay | time {MAX_HOLD_HOURS}h | chandelier {STOP_ATR_MULT}×ATR\n"
         "Data: MAINNET | Trading: TESTNET"
     )
 
@@ -770,8 +914,8 @@ def run_bot():
                     open_position(
                         entry_sym, is_long, all_data, equity,
                         cvd_signal, oi_signal,
-                        confluence="5/5 rule-based",
-                        reason=f"All 5 conditions met (ADX={adx_val:.1f})"
+                        confluence="7/7 rule-based",
+                        reason=f"All 7 conditions met (ADX={adx_val:.1f})"
                     )
                     time.sleep(SETTLE_SECONDS)
 

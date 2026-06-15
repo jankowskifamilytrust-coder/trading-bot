@@ -44,3 +44,11 @@ EMA_BAND_PCT = 0.02       # price within ±2% of EMA counts as "near"
 TRADE_LOG         = "data/trades.json"
 EQUITY_LOG        = "data/equity_curve.json"
 TRAILING_STOP_LOG = "data/trailing_peaks.json"
+
+FUNDING_LONG_MAX     = 0.05    # % — skip long if funding above this
+FUNDING_SHORT_MIN    = -0.05   # % — skip short if funding below this
+ADX_CVD_BOOST        = 30      # ADX required when CVD disagrees with direction
+ADX_DECAY_EXIT       = 20      # close if ADX drops below this while holding
+VOLUME_CONFIRM_RATIO = 0.7     # hook bar must have ≥70% of 10-bar avg volume
+MAX_HOLD_HOURS       = 5       # time exit if no break-even after this many hours
+STRUCT_STOP_BUFFER   = 0.3     # ATR buffer past swing low/high for structural stop
