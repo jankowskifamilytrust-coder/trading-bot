@@ -421,7 +421,6 @@ def _save_peaks(peaks):
     save_json(TRAILING_STOP_LOG, peaks)
 
 def init_peak(symbol, entry_price):
-    """Called on position open — seed the peak at fill price."""
     peaks = _load_peaks()
     peaks[symbol] = entry_price
     _save_peaks(peaks)
@@ -436,15 +435,16 @@ def clear_peak(symbol):
 
 def check_stops(positions, all_data, equity):
     """
-    Chandelier (trailing ATR) stop — the stop ratchets with price in the
-    profitable direction and never moves against the trade.
+    Two exit triggers, evaluated in order:
 
-    Long:  stop = max(entry, highest_price_since_entry) − STOP_ATR_MULT × ATR
-    Short: stop = min(entry, lowest_price_since_entry)  + STOP_ATR_MULT × ATR
+    1. Supertrend flip exit — if the daily Supertrend flips against the
+       position direction on this candle, close immediately (market order).
+       Catches trend reversals before the chandelier can react.
 
-    On the first tick for a position with no stored peak (e.g. restart), the
-    peak is seeded from entry price, so the stop starts at entry − 3×ATR and
-    tightens from there.
+    2. Chandelier (trailing ATR) stop with break-even lock —
+       stop = peak ± STOP_ATR_MULT × ATR, peak ratchets in the profitable
+       direction only. Once profit ≥ 1×ATR, the peak is floored so the stop
+       never falls below entry (break-even lock).
     """
     peaks = _load_peaks()
     peaks_changed = False
@@ -462,47 +462,76 @@ def check_stops(positions, all_data, equity):
         if not atr or not price or not entry:
             continue
 
-        # Seed peak from entry if we've never seen this position (e.g. bot restart)
+        # ── 1. Supertrend flip exit ───────────────────────────────────────────
+        st = data.get('supertrend', {})
+        if st.get('changed'):
+            st_dir = st.get('direction', 'neutral')
+            flip_against = (side == "LONG" and st_dir == "bearish") or \
+                           (side == "SHORT" and st_dir == "bullish")
+            if flip_against:
+                logger.warning(
+                    f"🔄 ST FLIP EXIT {sym} {side}: daily Supertrend just flipped "
+                    f"to {st_dir.upper()} — closing immediately"
+                )
+                send_telegram(
+                    f"🔄 <b>SUPERTREND FLIP EXIT {sym} {side}</b>\n"
+                    f"Daily ST flipped to {st_dir.upper()} — market close"
+                )
+                if close_position_market(sym, all_data, equity,
+                                         f"Supertrend flipped to {st_dir}"):
+                    clear_peak(sym)
+                    peaks.pop(sym, None)
+                    closed_any = True
+                    time.sleep(1)
+                continue  # skip chandelier for this symbol
+
+        # ── 2. Chandelier stop with break-even lock ───────────────────────────
         if sym not in peaks:
             peaks[sym] = entry
             peaks_changed = True
 
-        peak = peaks[sym]
+        peak          = peaks[sym]
         stop_distance = STOP_ATR_MULT * atr
 
         if side == "LONG":
             new_peak = max(peak, price)
+            # Break-even: profit ≥ 1×ATR → floor peak so stop ≥ entry
+            if price - entry >= atr:
+                new_peak = max(new_peak, entry + stop_distance)
             stop_price = new_peak - stop_distance
-            breached = price <= stop_price
+            breached   = price <= stop_price
         else:
             new_peak = min(peak, price)
+            if entry - price >= atr:
+                new_peak = min(new_peak, entry - stop_distance)
             stop_price = new_peak + stop_distance
-            breached = price >= stop_price
+            breached   = price >= stop_price
 
-        # Ratchet the peak forward if price moved in our favour
         if new_peak != peak:
             peaks[sym] = new_peak
             peaks_changed = True
 
-        trail_gain = abs(new_peak - entry)
+        be_active = (side == "LONG" and new_peak >= entry + stop_distance) or \
+                    (side == "SHORT" and new_peak <= entry - stop_distance)
+        be_tag = " [BE]" if be_active else ""
         logger.debug(
             f"Chandelier {sym} {side}: entry=${entry:.4f} peak=${new_peak:.4f} "
-            f"(+${trail_gain:.4f}) | stop=${stop_price:.4f} | now=${price:.4f}"
+            f"stop=${stop_price:.4f}{be_tag} | now=${price:.4f}"
         )
 
         if breached:
+            stop_label = "break-even stop" if be_active else f"chandelier ({STOP_ATR_MULT}×ATR)"
             logger.warning(
-                f"🛑 TRAILING STOP {sym} {side}: peak ${new_peak:.4f} → "
-                f"stop ${stop_price:.4f} | now ${price:.4f}"
+                f"🛑 {stop_label.upper()} {sym} {side}: "
+                f"peak ${new_peak:.4f} → stop ${stop_price:.4f} | now ${price:.4f}"
             )
             send_telegram(
-                f"🛑 <b>TRAILING STOP {sym} {side}</b>\n"
+                f"🛑 <b>{stop_label.upper()} {sym} {side}</b>\n"
                 f"Entry: ${entry:.4f} | Peak: ${new_peak:.4f}\n"
-                f"Trail stop: ${stop_price:.4f} ({STOP_ATR_MULT}×ATR=${stop_distance:.4f})\n"
-                f"Now: ${price:.4f} — market close"
+                f"Stop: ${stop_price:.4f} | Now: ${price:.4f}"
             )
             if close_position_market(sym, all_data, equity,
-                                     f"Chandelier stop ({STOP_ATR_MULT}×ATR from peak ${new_peak:.4f})"):
+                                     f"{stop_label} at ${stop_price:.4f}"):
                 clear_peak(sym)
                 peaks.pop(sym, None)
                 closed_any = True
@@ -512,151 +541,139 @@ def check_stops(positions, all_data, equity):
         _save_peaks(peaks)
     return closed_any
 
-# ─── Claude Decision ──────────────────────────────────────────────────────────
+# ─── Claude Exit Management ───────────────────────────────────────────────────
 
-def ask_claude(all_data, equity, positions):
-    market_summary = ""
-    for symbol, data in all_data.items():
-        pos = positions.get(symbol)
-        pos_str = f"OPEN {pos['side']} {abs(pos['size'])} @ ${pos['entry']:.4f}" if pos else "no position"
-        vol_str = f"{data['daily_vol']*100:.1f}%" if data.get('daily_vol') else "n/a"
-        st  = data['supertrend']
-        adx = data['adx']
-        st_flip  = " ← TREND JUST FLIPPED" if st['changed'] else ""
-        adx_gate = f"TRENDING — eligible (ADX {adx['adx']:.1f} > {ADX_THRESHOLD})" if adx['trending'] else f"CHOPPY — no entry (ADX {adx['adx']:.1f} ≤ {ADX_THRESHOLD})"
+def ask_claude_exits(positions, all_data, equity):
+    """
+    Claude's sole job: decide whether to CLOSE, FLIP, or HOLD each open position.
+    It never sees the full symbol universe and cannot open new positions.
+    Entries are handled by the rule-based select_entry().
+    """
+    pos_summary = ""
+    for sym, p in positions.items():
+        data  = all_data.get(sym, {})
+        price = data.get('tn_price') or data.get('price', 0)
+        entry = p['entry']
+        size  = abs(p['size'])
+        side  = p['side']
+        unreal     = _pos_pnl(p, price) if price else 0
+        unreal_pct = (unreal / (size * entry) * 100) if entry and size else 0
+        sign   = "+" if unreal >= 0 else ""
+        st     = data.get('supertrend', {})
+        adx    = data.get('adx', {})
         rsi_d  = data.get('rsi_60', {})
         ema_v  = data.get('ema20_60')
-        price  = data.get('tn_price') or data.get('price', 0)
-        rsi    = rsi_d.get('rsi', 50.0)
-        p_rsi  = rsi_d.get('prev_rsi', 50.0)
-        min_r  = rsi_d.get('min_recent', 50.0)
-        max_r  = rsi_d.get('max_recent', 50.0)
-        ema_str = f"${ema_v:.4f}" if ema_v else "n/a"
-        if ema_v and price:
-            pct_ema = (price - ema_v) / ema_v * 100
-            pct_str = f"{pct_ema:+.1f}%"
-            near_ema = abs(pct_ema) <= EMA_BAND_PCT * 100
-        else:
-            pct_str = "n/a"; near_ema = False
-        c2_long  = min_r < RSI_LONG_THRESHOLD
-        c2_short = max_r > RSI_SHORT_THRESHOLD
-        c4_long  = rsi > p_rsi
-        c4_short = rsi < p_rsi
-        long_ready  = c2_long  and near_ema and c4_long
-        short_ready = c2_short and near_ema and c4_short
+        pct_ema = f"{(price - ema_v) / ema_v * 100:+.1f}%" if ema_v and price else "n/a"
+        cvd    = data.get('cvd', {})
+        obi    = data.get('obi', {})
+        vpin   = data.get('vpin', {})
+        oi     = data.get('oi', {})
 
-        market_summary += f"""
-{symbol} (${data['price']:.4f}) [{pos_str}] | 24h Vol: ${data['oi']['day_volume']:,.0f} | Daily vol: {vol_str}:
-  Supertrend (daily, ATR {SUPERTREND_PERIOD}, ×{SUPERTREND_MULT}): {st['direction'].upper()} @ {st['value']:.4f}{st_flip}
-  ADX (daily, {ADX_PERIOD}): {adx['adx']:.1f} | +DI {adx['plus_di']:.1f} / -DI {adx['minus_di']:.1f} | {adx_gate}
-  60-min pullback (RSI {RSI_PERIOD} / EMA {EMA_PERIOD}):
-    RSI={rsi:.1f} (1h ago: {p_rsi:.1f}) | {RSI_LOOKBACK}-bar range: [{min_r:.1f}–{max_r:.1f}]
-    20-EMA={ema_str} | Price {pct_str} from EMA
-    Long  C2+C3+C4: dip<{RSI_LONG_THRESHOLD}={'✓' if c2_long else '✗'} | near EMA={'✓' if near_ema else '✗'} | hook↑={'✓' if c4_long else '✗'} → {'SETUP READY ✅' if long_ready else 'waiting'}
-    Short C2+C3+C4: spike>{RSI_SHORT_THRESHOLD}={'✓' if c2_short else '✗'} | near EMA={'✓' if near_ema else '✗'} | hook↓={'✓' if c4_short else '✗'} → {'SETUP READY ✅' if short_ready else 'waiting'}
-  Candles (last 10h):
-{data['candle_summary']}
-  Orderflow:
-    CVD: {data['cvd']['cvd']} | Trend: {data['cvd']['cvd_trend']} | {data['cvd']['divergence']}
-    OBI: {data['obi']['obi']} | {data['obi']['signal']} | Bids: {data['obi']['bid_vol']} / Asks: {data['obi']['ask_vol']}
-    VPIN: {data['vpin']['vpin']} | {data['vpin']['signal']}
-  Open Interest:
-    OI: ${data['oi']['oi_usd']:,.0f} ({data['oi']['oi_tokens']} tokens)
-    Volume change 4h: {data['oi']['vol_change_pct']:+.1f}% — {data['oi']['oi_signal']}
-    Funding rate: {data['oi']['funding']}% — {data['oi']['funding_signal']}
+        pos_summary += f"""
+{sym} {side} {size} @ ${entry:.4f} | Now ${price:.4f} | P&L: {sign}${unreal:.2f} ({sign}{unreal_pct:.1f}%)
+  Supertrend (daily): {st.get('direction','?').upper()} @ {st.get('value',0):.4f}{' ← JUST FLIPPED' if st.get('changed') else ''}
+  ADX: {adx.get('adx',0):.1f} | +DI {adx.get('plus_di',0):.1f} / -DI {adx.get('minus_di',0):.1f}
+  RSI(60m): {rsi_d.get('rsi',50):.1f} (prev {rsi_d.get('prev_rsi',50):.1f}) | Price vs EMA20: {pct_ema}
+  CVD: {cvd.get('cvd_trend','?')} | {cvd.get('divergence','?')}
+  OBI: {obi.get('obi',0)} | {obi.get('signal','?')}
+  VPIN: {vpin.get('vpin',0)} | {vpin.get('signal','?')}
+  OI: {oi.get('oi_signal','?')} | Funding: {oi.get('funding',0):.4f}% ({oi.get('funding_signal','?')})
 """
 
-    pos_summary = "\n".join([
-        f"  {sym}: {p['side']} {abs(p['size'])} @ ${p['entry']:.4f}"
-        for sym, p in positions.items()
-    ]) if positions else "  No open positions"
+    prompt = f"""You are a professional crypto trading assistant managing open positions on Hyperliquid perps.
 
-    prompt = f"""
-You are a professional crypto trading assistant with deep orderflow analysis expertise.
-You trade BOTH directions — long and short — on Hyperliquid testnet perps.
-You monitor the most liquid perps by 24h dollar volume (stablecoins excluded).
+Your ONLY job: decide whether to CLOSE, FLIP, or HOLD each open position.
+Entries are handled separately by a rule-based system — do NOT suggest opening new positions.
 
-Account equity: ${equity:.2f}
-Leverage: {LEVERAGE}x
-Position sizing is VOLATILITY-TARGETED automatically (you do not set size):
-each position targets {VOL_TARGET_PCT*100:.0f}% of equity in daily risk, capped at ${MAX_NOTIONAL_USD} notional.
-Orders are placed as POST-ONLY maker limits, so an entry may not fill if price moves away — that's expected.
-Max concurrent positions: {MAX_POSITIONS}
-Current open positions: {len(positions)}/{MAX_POSITIONS}
-An automatic {STOP_ATR_MULT}×ATR stop-loss (market order) protects every position.
+Account equity: ${equity:.2f} | Leverage: {LEVERAGE}x | Positions: {len(positions)}/{MAX_POSITIONS}
+Chandelier trailing stop ({STOP_ATR_MULT}×ATR from peak) and Supertrend flip exit run automatically.
 
 Open positions:
 {pos_summary}
 
-Market data + orderflow signals:
-{market_summary}
+Exit signals to act on:
+- CVD divergence against position (price up + CVD falling for a long) → CLOSE
+- OBI flipping against position direction → CLOSE
+- VPIN > 0.4 + divergence → informed traders moving against you → CLOSE
+- OI falling while price holds → short-covering rally / weak trend → CLOSE
+- Funding rate strongly against your direction (paying the crowd) → CLOSE or FLIP
+- Daily Supertrend already flipped against your position → FLIP
+- All signals still aligned with position → HOLD
 
-Signal interpretation guide:
-- Supertrend (daily) is the PRIMARY TREND BIAS — it is enforced as a HARD FILTER:
-    BULLISH Supertrend → only OPEN_LONG is allowed (OPEN_SHORT will be blocked).
-    BEARISH Supertrend → only OPEN_SHORT is allowed (OPEN_LONG will be blocked).
-    CLOSE and FLIP are never blocked by Supertrend.
-    A Supertrend FLIP on the latest daily candle is a strong directional signal.
-- ADX (daily) measures TREND STRENGTH — it is also enforced as a HARD FILTER:
-    ADX > {ADX_THRESHOLD} = trending, entries allowed. ADX ≤ {ADX_THRESHOLD} = choppy, no new entries.
-    When multiple symbols have ADX > {ADX_THRESHOLD}, pick the one with the HIGHEST ADX — strongest trend wins.
-    +DI > -DI = bullish momentum. -DI > +DI = bearish momentum (confirms direction).
-- PULLBACK ENTRY (60-min) — enforced as a HARD FILTER, all 3 conditions must be met:
-    C2: RSI({RSI_PERIOD}) dipped below {RSI_LONG_THRESHOLD} in the last {RSI_LOOKBACK} bars (longs) / spiked above {RSI_SHORT_THRESHOLD} (shorts).
-        Trend-adjusted thresholds — in a strong trend, overbought/oversold comes earlier.
-    C3: Price within ±{EMA_BAND_PCT*100:.0f}% of the 20-EMA on 60-min — pulled back to support, not collapsed through.
-    C4: RSI is now hooking back up (longs: RSI > prior bar RSI) / down (shorts) — confirming trend resumption.
-    When a symbol shows "SETUP READY ✅", it is the highest-priority pick for an entry.
-    If no symbol has a ready setup, HOLD — do not force an entry.
-- CVD rising = buyers in control (bullish). Falling = sellers (bearish).
-- CVD divergence: price up + CVD down = bearish reversal risk. Price down + CVD up = bullish reversal.
-- OBI >+0.3 = bullish (bid heavy), <-0.3 = bearish (ask heavy), near 0 = neutral.
-- VPIN high (>0.4) = informed traders active, expect big directional move soon.
-- OI rising + price rising = strong bullish conviction (new longs).
-- OI rising + price falling = strong bearish conviction (new shorts).
-- OI falling + price rising = weak rally, short covering — fade candidate.
-- High positive funding = crowded longs, squeeze/reversal down risk → favors SHORT.
-- High negative funding = crowded shorts, squeeze up risk → favors LONG.
-
-LONG setup (OPEN_LONG): Supertrend BULLISH + ADX > {ADX_THRESHOLD} + RSI dipped <{RSI_LONG_THRESHOLD} + near 20-EMA + RSI hooking up + CVD/OBI/OI confirming
-SHORT setup (OPEN_SHORT): Supertrend BEARISH + ADX > {ADX_THRESHOLD} + RSI spiked >{RSI_SHORT_THRESHOLD} + near 20-EMA + RSI hooking down + CVD/OBI/OI confirming
-Strong reversal where you already hold the wrong side → FLIP
-
-Available actions:
-- OPEN_LONG  — open a new long (only if no position in this symbol, positions < {MAX_POSITIONS})
-- OPEN_SHORT — open a new short (only if no position in this symbol, positions < {MAX_POSITIONS})
-- CLOSE      — close an existing position in this symbol (lock profit or cut loss)
-- FLIP       — close current position AND open opposite direction (only on strong reversal signals)
-- HOLD       — do nothing
-
-Rules:
-- Be willing to SHORT as readily as LONG — markets fall too.
-- Only OPEN if current positions < {MAX_POSITIONS}
-- CLOSE or FLIP only apply to symbols you already hold.
-- FLIP is aggressive — only use it on clear 3+ signal reversals against your current position.
-- Prefer higher 24h volume when signals are otherwise equal.
-
-Pick the SINGLE best action across all symbols.
+FLIP only on 3+ signal reversal (Supertrend flip + CVD divergence + OBI flip).
+Pick the SINGLE most urgent action, or HOLD if positions look healthy.
 
 Respond in this exact format:
-SYMBOL: which asset (or NONE)
-ACTION: OPEN_LONG or OPEN_SHORT or CLOSE or FLIP or HOLD
-SIZE: 0 (sizing is automatic — always put 0)
+SYMBOL: asset symbol (or NONE)
+ACTION: CLOSE or FLIP or HOLD
 CVD_SIGNAL: bullish or bearish or neutral
 OBI_SIGNAL: bullish or bearish or neutral
 OI_SIGNAL: bullish or bearish or neutral
-CONFLUENCE: score out of 4 (e.g. 3/4)
-REASON: one sentence explaining the directional orderflow confluence
+CONFLUENCE: score out of 4
+REASON: one sentence
 """
 
     message = claude.messages.create(
         model="claude-opus-4-8",
-        max_tokens=400,
+        max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text
 
-# ─── Decision Routing ─────────────────────────────────────────────────────────
+
+# ─── Rule-Based Entry Selection ───────────────────────────────────────────────
+
+def select_entry(all_data, positions):
+    """
+    Evaluates all 5 entry conditions for every non-held symbol and returns
+    (symbol, is_long) for the best qualifying setup (highest ADX), or (None, None).
+
+    Conditions:
+      C1a  Daily Supertrend direction (bullish → long, bearish → short)
+      C1b  Daily ADX > ADX_THRESHOLD
+      C2   60-min RSI dipped below RSI_LONG_THRESHOLD / spiked above RSI_SHORT_THRESHOLD
+      C3   Price within ±EMA_BAND_PCT of 20-EMA on 60-min
+      C4   RSI hook back in trend direction
+    """
+    candidates = []
+    for symbol, data in all_data.items():
+        if symbol in positions:
+            continue
+
+        st_dir = data.get('supertrend', {}).get('direction', 'neutral')
+        if st_dir == 'neutral':
+            continue
+        is_long = (st_dir == 'bullish')
+        action  = "OPEN_LONG" if is_long else "OPEN_SHORT"
+
+        adx_data = data.get('adx', {})
+        if not adx_data.get('trending', False):
+            logger.debug(f"  {symbol}: ADX {adx_data.get('adx',0):.1f} ≤ {ADX_THRESHOLD} — skip")
+            continue
+
+        passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
+        if not passed:
+            logger.debug(f"  {symbol} {action}: pullback not ready — {pb_reason}")
+            continue
+
+        adx_val = adx_data.get('adx', 0.0)
+        logger.info(f"  {symbol} {action}: SETUP READY — ADX={adx_val:.1f} | {pb_reason}")
+        candidates.append((symbol, is_long, adx_val))
+
+    if not candidates:
+        logger.info("No entry setup ready this cycle")
+        return None, None
+
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    best_sym, best_is_long, best_adx = candidates[0]
+    direction = "LONG" if best_is_long else "SHORT"
+    logger.info(
+        f"Best entry: {best_sym} {direction} (ADX={best_adx:.1f}) "
+        f"— {len(candidates)} setup(s) qualified"
+    )
+    return best_sym, best_is_long
+
+# ─── Exit Routing ─────────────────────────────────────────────────────────────
 
 def _check_pullback_entry(symbol, all_data, action):
     """
@@ -718,7 +735,8 @@ def _parse_decision(text):
             fields[key.strip()] = val.strip()
     return fields
 
-def execute_decision(decision_text, all_data, equity, positions):
+def execute_exit(decision_text, all_data, equity, positions):
+    """Routes Claude's exit decision (CLOSE / FLIP / HOLD only)."""
     f = _parse_decision(decision_text)
     symbol     = f.get("SYMBOL", "")
     action     = f.get("ACTION", "").upper()
@@ -728,46 +746,17 @@ def execute_decision(decision_text, all_data, equity, positions):
     confluence = f.get("CONFLUENCE", "")
     reason     = f.get("REASON", "")
 
-    logger.info(f"Symbol: {symbol} | Action: {action} | Confluence: {confluence}")
-    logger.info(f"CVD: {cvd_signal} | OBI: {obi_signal} | OI: {oi_signal}")
-    logger.info(f"Reason: {reason}")
-
-    held = positions.get(symbol)
+    logger.info(f"Claude exit: {symbol} {action} | {confluence} | {reason}")
 
     if action == "HOLD" or symbol in ["NONE", ""]:
-        logger.info("HOLD — no action taken")
-        log_trade("HOLD", symbol, 0, 0, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
+        logger.info("Claude: HOLD — positions look healthy")
         return False
 
     if symbol not in all_data:
-        logger.error(f"Symbol {symbol} not in market data (may have been skipped for wide oracle gap)")
+        logger.error(f"{symbol} not in market data")
         return False
 
-    if action in ("OPEN_LONG", "OPEN_SHORT"):
-        if held:
-            logger.warning(f"{symbol} already has a {held['side']} position — ignoring {action}")
-            return False
-        if len(positions) >= MAX_POSITIONS:
-            logger.warning(f"Max positions ({MAX_POSITIONS}) reached — skipping")
-            log_trade("SKIPPED", symbol, 0, 0, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
-            return False
-        st_dir = all_data[symbol].get('supertrend', {}).get('direction', 'neutral')
-        if st_dir == 'bearish' and action == "OPEN_LONG":
-            logger.info(f"{symbol} OPEN_LONG blocked — daily Supertrend is BEARISH")
-            return False
-        if st_dir == 'bullish' and action == "OPEN_SHORT":
-            logger.info(f"{symbol} OPEN_SHORT blocked — daily Supertrend is BULLISH")
-            return False
-        adx_data = all_data[symbol].get('adx', {})
-        if not adx_data.get('trending', False):
-            logger.info(f"{symbol} {action} blocked — ADX {adx_data.get('adx', 0):.1f} ≤ {ADX_THRESHOLD} (choppy, no trend)")
-            return False
-        passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
-        if not passed:
-            logger.info(f"{symbol} {action} blocked — pullback: {pb_reason}")
-            return False
-        return open_position(symbol, action == "OPEN_LONG", all_data, equity,
-                             cvd_signal, obi_signal, oi_signal, confluence, reason)
+    held = positions.get(symbol)
 
     if action == "CLOSE":
         if not held:
@@ -778,11 +767,7 @@ def execute_decision(decision_text, all_data, equity, positions):
 
     if action == "FLIP":
         if not held:
-            logger.warning(f"{symbol} has no position to FLIP — treating as fresh open")
-            is_buy = cvd_signal == "bullish"
-            if len(positions) < MAX_POSITIONS:
-                return open_position(symbol, is_buy, all_data, equity,
-                                     cvd_signal, obi_signal, oi_signal, confluence, reason)
+            logger.warning(f"{symbol} no position to FLIP")
             return False
         current_side = held['side']
         logger.info(f"FLIP {symbol}: market-closing {current_side} then maker-opening opposite")
@@ -791,10 +776,11 @@ def execute_decision(decision_text, all_data, equity, positions):
             time.sleep(SETTLE_SECONDS)
             new_is_buy = current_side == "SHORT"
             return open_position(symbol, new_is_buy, all_data, equity,
-                                 cvd_signal, obi_signal, oi_signal, confluence, f"FLIP open: {reason}")
+                                 cvd_signal, obi_signal, oi_signal, confluence,
+                                 f"FLIP open: {reason}")
         return False
 
-    logger.warning(f"Unknown action: {action} — no trade")
+    logger.warning(f"Unexpected action from Claude exit: {action}")
     return False
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -914,20 +900,20 @@ def run_bot():
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
     logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 24h dollar volume")
     logger.info(f"Pinned symbols: {', '.join(PINNED)}")
-    logger.info(f"Entries: POST-ONLY maker (passive → 1 aggressive reprice, else skip)")
-    logger.info(f"Discretionary closes: maker w/ market fallback | Stops & flips: market")
-    logger.info(f"Signals: CVD + OBI + VPIN + OI + Funding (from MAINNET)")
+    logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
+    logger.info(f"Exits: chandelier trailing stop + Supertrend flip (automatic) + Claude (discretionary)")
     logger.info(f"Sizing: VOL-TARGETED {VOL_TARGET_PCT*100:.0f}% daily risk, cap ${MAX_NOTIONAL_USD} notional")
-    logger.info(f"Stop-loss: {STOP_ATR_MULT}×ATR | Maker wait: {MAKER_WAIT_SECONDS}s | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
-    logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS}")
+    logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +1×ATR")
+    logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS} | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
     logger.info(f"Data: MAINNET | Trading: TESTNET | Interval: {INTERVAL_MINUTES}min (clock-aligned)")
 
     init_files()
     get_testnet_coins()
     send_telegram(
-        "🤖 <b>Trading Bot Started</b> (maker orders)\n"
+        "🤖 <b>Trading Bot Started</b>\n"
         f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max {MAX_POSITIONS}\n"
-        f"Post-only entries | Vol-targeted {VOL_TARGET_PCT*100:.0f}% | {STOP_ATR_MULT}×ATR stop\n"
+        f"Entries: rule-based (ST + ADX + pullback) | Post-only maker\n"
+        f"Exits: chandelier {STOP_ATR_MULT}×ATR + ST flip + Claude\n"
         "Data: MAINNET | Trading: TESTNET"
     )
 
@@ -936,34 +922,52 @@ def run_bot():
             logger.info("--- New cycle ---")
 
             positions = get_open_positions()
-            symbols = get_top_symbols(TOP_N, extra_symbols=list(positions.keys()))
-
-            all_data = get_all_market_data(symbols, open_position_syms=set(positions.keys()))
-            equity = get_equity()
+            symbols   = get_top_symbols(TOP_N, extra_symbols=list(positions.keys()))
+            all_data  = get_all_market_data(symbols, open_position_syms=set(positions.keys()))
+            equity    = get_equity()
 
             logger.info(f"Equity: ${equity:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
-
             log_equity(equity, all_data, positions)
 
+            # ── Step 1: Automatic stops (chandelier + Supertrend flip) ────────
             if positions:
                 stopped = check_stops(positions, all_data, equity)
                 if stopped:
                     time.sleep(SETTLE_SECONDS)
                     positions = get_open_positions()
-                    equity = get_equity()
+                    equity    = get_equity()
 
-            logger.info("Asking Claude to analyze orderflow (long & short)...")
-            decision = ask_claude(all_data, equity, positions)
-            logger.info(f"Claude responded:\n{decision}")
+            # ── Step 2: Claude exit management (only if holding positions) ────
+            if positions:
+                logger.info("Asking Claude to review open positions for exits...")
+                exit_decision = ask_claude_exits(positions, all_data, equity)
+                logger.info(f"Claude exit:\n{exit_decision}")
+                exited = execute_exit(exit_decision, all_data, equity, positions)
+                if exited:
+                    time.sleep(SETTLE_SECONDS)
+                    positions = get_open_positions()
+                    equity    = get_equity()
 
-            traded = execute_decision(decision, all_data, equity, positions)
-
-            if traded:
-                logger.info(f"Trade executed — waiting {SETTLE_SECONDS}s for settlement before summary")
-                time.sleep(SETTLE_SECONDS)
+            # ── Step 3: Rule-based entry (only if slot available) ─────────────
+            if len(positions) < MAX_POSITIONS:
+                logger.info("Scanning for entry setups...")
+                entry_sym, is_long = select_entry(all_data, positions)
+                if entry_sym:
+                    data       = all_data[entry_sym]
+                    cvd_signal = data.get('cvd', {}).get('cvd_trend', 'neutral')
+                    obi_signal = data.get('obi', {}).get('signal', 'neutral')
+                    oi_signal  = data.get('oi', {}).get('oi_signal', 'stable')
+                    adx_val    = data.get('adx', {}).get('adx', 0)
+                    open_position(
+                        entry_sym, is_long, all_data, equity,
+                        cvd_signal, obi_signal, oi_signal,
+                        confluence="5/5 rule-based",
+                        reason=f"All 5 conditions met (ADX={adx_val:.1f})"
+                    )
+                    time.sleep(SETTLE_SECONDS)
 
             positions = get_open_positions()
-            equity = get_equity()
+            equity    = get_equity()
             print_summary(equity, positions, all_data)
 
             sleep_until_next_hour()
