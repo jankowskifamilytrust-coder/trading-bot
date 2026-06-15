@@ -79,8 +79,6 @@ def get_testnet_book(symbol):
 
         def px(level):
             return float(level['px']) if isinstance(level, dict) else float(level[0])
-        def px_str(level):
-            return str(level['px']) if isinstance(level, dict) else str(level[0])
 
         best_bid = px(bids[0])
         best_ask = px(asks[0])
@@ -96,7 +94,7 @@ def get_testnet_book(symbol):
             tick = abs(best_ask - best_bid)
 
         # decimals from the best-ask price string
-        s = px_str(asks[0])
+        s = str(asks[0]['px']) if isinstance(asks[0], dict) else str(asks[0][0])
         decimals = len(s.split('.')[1]) if '.' in s else 0
 
         return best_bid, best_ask, tick, decimals
@@ -141,7 +139,7 @@ def load_json(filepath, default):
     try:
         with open(filepath, "r") as f:
             return json.load(f)
-    except:
+    except Exception:
         return default
 
 def save_json(filepath, data):
@@ -153,7 +151,7 @@ def init_files():
         try:
             with open(filepath, "r") as f:
                 json.load(f)
-        except:
+        except Exception:
             save_json(filepath, default)
             logger.info(f"Created {filepath}")
 
@@ -233,7 +231,7 @@ def get_equity():
     try:
         user_state = testnet_info.user_state(wallet.address)
         return float(user_state['marginSummary']['accountValue'])
-    except:
+    except Exception:
         return 0.0
 
 # ─── Signals (from MAINNET) ───────────────────────────────────────────────────
@@ -253,7 +251,7 @@ def compute_daily_vol(candles):
         variance = sum((r - mean) ** 2 for r in returns) / len(returns)
         hourly_vol = variance ** 0.5
         return hourly_vol * (24 ** 0.5)
-    except:
+    except Exception:
         return None
 
 def compute_atr(candles, period=ATR_PERIOD):
@@ -271,7 +269,7 @@ def compute_atr(candles, period=ATR_PERIOD):
             return None
         recent = trs[-period:]
         return sum(recent) / len(recent)
-    except:
+    except Exception:
         return None
 
 def compute_cvd(candles):
@@ -314,7 +312,7 @@ def compute_obi(l2_data):
         obi = (bid_vol - ask_vol) / total
         signal = "bullish (bid heavy)" if obi > 0.3 else "bearish (ask heavy)" if obi < -0.3 else "neutral"
         return {"obi": round(obi, 3), "signal": signal, "bid_vol": round(bid_vol, 2), "ask_vol": round(ask_vol, 2)}
-    except:
+    except Exception:
         return {"obi": 0.0, "signal": "unknown", "bid_vol": 0, "ask_vol": 0}
 
 def compute_vpin(candles, bucket_size=10):
@@ -336,7 +334,7 @@ def compute_vpin(candles, bucket_size=10):
         signal = ("high (informed trading — expect volatility)" if vpin > 0.4
                   else "moderate" if vpin > 0.25 else "low (retail flow)")
         return {"vpin": vpin, "signal": signal}
-    except:
+    except Exception:
         return {"vpin": 0.5, "signal": "unknown"}
 
 def compute_oi(symbol, candles, price):
@@ -699,6 +697,11 @@ def close_position_market(symbol, all_data, equity, reason,
         send_telegram(f"⚠️ <b>Close {symbol} FAILED</b>\n{str(e)[:200]}")
         return False
 
+def _log_maker_close(symbol, fill_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence):
+    logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (MAKER)")
+    log_trade("CLOSE", symbol, 0, fill_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
+    send_telegram(f"🔴 <b>CLOSE</b> (maker)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
+
 def close_position_maker(symbol, all_data, equity, reason,
                          cvd_signal="", obi_signal="", oi_signal="", confluence=""):
     """
@@ -720,17 +723,12 @@ def close_position_maker(symbol, all_data, equity, reason,
         status, oid, fpx, fsz, err = place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=True)
         if status == 'resting':
             if wait_until(symbol, want_open=False, seconds=MAKER_WAIT_SECONDS):
-                logger.success(f"✅ CLOSE {symbol} @ ${limit_px:.4f} (MAKER)")
-                log_trade("CLOSE", symbol, 0, limit_px, reason, equity,
-                          cvd_signal, obi_signal, oi_signal, confluence)
-                send_telegram(f"🔴 <b>CLOSE</b> (maker)\nSymbol: <b>{symbol}</b>\nPrice: ${limit_px:.4f}\nReason: {reason}")
+                _log_maker_close(symbol, limit_px, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
                 return True
             cancel_order(symbol, oid)
             logger.info(f"{symbol} maker close unfilled — falling back to market")
         elif status == 'filled':
-            logger.success(f"✅ CLOSE {symbol} @ ${fpx:.4f} (MAKER)")
-            log_trade("CLOSE", symbol, 0, fpx, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
-            send_telegram(f"🔴 <b>CLOSE</b> (maker)\nSymbol: <b>{symbol}</b>\nPrice: ${fpx:.4f}\nReason: {reason}")
+            _log_maker_close(symbol, fpx, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
             return True
         else:
             logger.info(f"{symbol} maker close not resting ({status}: {err}) — falling back to market")
@@ -876,25 +874,23 @@ REASON: one sentence explaining the directional orderflow confluence
 
 # ─── Decision routing ─────────────────────────────────────────────────────────
 
-def execute_decision(decision_text, all_data, equity, positions):
-    lines = decision_text.strip().split("\n")
-    symbol = action = cvd_signal = obi_signal = oi_signal = confluence = reason = ""
+def _parse_decision(text):
+    fields = {}
+    for line in text.strip().split("\n"):
+        if ":" in line:
+            key, _, val = line.partition(":")
+            fields[key.strip()] = val.strip()
+    return fields
 
-    for line in lines:
-        if line.startswith("SYMBOL:"):
-            symbol = line.split(":")[1].strip()
-        elif line.startswith("ACTION:"):
-            action = line.split(":")[1].strip().upper()
-        elif line.startswith("CVD_SIGNAL:"):
-            cvd_signal = line.split(":")[1].strip()
-        elif line.startswith("OBI_SIGNAL:"):
-            obi_signal = line.split(":")[1].strip()
-        elif line.startswith("OI_SIGNAL:"):
-            oi_signal = line.split(":")[1].strip()
-        elif line.startswith("CONFLUENCE:"):
-            confluence = line.split(":")[1].strip()
-        elif line.startswith("REASON:"):
-            reason = line.split(":", 1)[1].strip()
+def execute_decision(decision_text, all_data, equity, positions):
+    f = _parse_decision(decision_text)
+    symbol     = f.get("SYMBOL", "")
+    action     = f.get("ACTION", "").upper()
+    cvd_signal = f.get("CVD_SIGNAL", "")
+    obi_signal = f.get("OBI_SIGNAL", "")
+    oi_signal  = f.get("OI_SIGNAL", "")
+    confluence = f.get("CONFLUENCE", "")
+    reason     = f.get("REASON", "")
 
     logger.info(f"Symbol: {symbol} | Action: {action} | Confluence: {confluence}")
     logger.info(f"CVD: {cvd_signal} | OBI: {obi_signal} | OI: {oi_signal}")
@@ -911,56 +907,44 @@ def execute_decision(decision_text, all_data, equity, positions):
         logger.error(f"Symbol {symbol} not in market data (may have been skipped for wide oracle gap)")
         return False
 
-    if action == "OPEN_LONG":
+    if action in ("OPEN_LONG", "OPEN_SHORT"):
         if held:
-            logger.warning(f"{symbol} already has a {held['side']} position — ignoring OPEN_LONG")
+            logger.warning(f"{symbol} already has a {held['side']} position — ignoring {action}")
             return False
         if len(positions) >= MAX_POSITIONS:
             logger.warning(f"Max positions ({MAX_POSITIONS}) reached — skipping")
             log_trade("SKIPPED", symbol, 0, 0, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
             return False
-        return open_position(symbol, True, all_data, equity,
-                            cvd_signal, obi_signal, oi_signal, confluence, reason)
+        return open_position(symbol, action == "OPEN_LONG", all_data, equity,
+                             cvd_signal, obi_signal, oi_signal, confluence, reason)
 
-    elif action == "OPEN_SHORT":
-        if held:
-            logger.warning(f"{symbol} already has a {held['side']} position — ignoring OPEN_SHORT")
-            return False
-        if len(positions) >= MAX_POSITIONS:
-            logger.warning(f"Max positions ({MAX_POSITIONS}) reached — skipping")
-            log_trade("SKIPPED", symbol, 0, 0, reason, equity, cvd_signal, obi_signal, oi_signal, confluence)
-            return False
-        return open_position(symbol, False, all_data, equity,
-                            cvd_signal, obi_signal, oi_signal, confluence, reason)
-
-    elif action == "CLOSE":
+    if action == "CLOSE":
         if not held:
             logger.warning(f"{symbol} has no open position to CLOSE")
             return False
         return close_position_maker(symbol, all_data, equity, reason,
                                     cvd_signal, obi_signal, oi_signal, confluence)
 
-    elif action == "FLIP":
+    if action == "FLIP":
         if not held:
             logger.warning(f"{symbol} has no position to FLIP — treating as fresh open")
             is_buy = cvd_signal == "bullish"
             if len(positions) < MAX_POSITIONS:
                 return open_position(symbol, is_buy, all_data, equity,
-                                    cvd_signal, obi_signal, oi_signal, confluence, reason)
+                                     cvd_signal, obi_signal, oi_signal, confluence, reason)
             return False
         current_side = held['side']
         logger.info(f"FLIP {symbol}: market-closing {current_side} then maker-opening opposite")
-        # Close with a market order for certainty on the reversal
         if close_position_market(symbol, all_data, equity, f"FLIP close: {reason}",
                                  cvd_signal, obi_signal, oi_signal, confluence):
             time.sleep(SETTLE_SECONDS)
             new_is_buy = current_side == "SHORT"
             return open_position(symbol, new_is_buy, all_data, equity,
-                                cvd_signal, obi_signal, oi_signal, confluence, f"FLIP open: {reason}")
+                                 cvd_signal, obi_signal, oi_signal, confluence, f"FLIP open: {reason}")
         return False
-    else:
-        logger.warning(f"Unknown action: {action} — no trade")
-        return False
+
+    logger.warning(f"Unknown action: {action} — no trade")
+    return False
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -991,6 +975,12 @@ def log_equity(equity, all_data, positions):
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 
+def _pos_pnl(pos, current_price):
+    size = abs(pos['size'])
+    if pos['side'] == "LONG":
+        return (current_price - pos['entry']) * size
+    return (pos['entry'] - current_price) * size
+
 def print_summary(equity, positions, all_data):
     curve = load_json(EQUITY_LOG, [])
     trades = load_json(TRADE_LOG, [])
@@ -1003,12 +993,8 @@ def print_summary(equity, positions, all_data):
     unrealized_pnl = 0.0
     for sym, p in positions.items():
         current_price = all_data.get(sym, {}).get('tn_price', 0) or all_data.get(sym, {}).get('price', 0)
-        entry = p['entry']; size = abs(p['size'])
-        if current_price and entry:
-            if p['side'] == "LONG":
-                unrealized_pnl += (current_price - entry) * size
-            else:
-                unrealized_pnl += (entry - current_price) * size
+        if current_price and p['entry']:
+            unrealized_pnl += _pos_pnl(p, current_price)
 
     realized_pnl = (equity - start_equity) - unrealized_pnl
     total_pnl = equity - start_equity
@@ -1036,12 +1022,8 @@ def print_summary(equity, positions, all_data):
             entry = p['entry']; size = abs(p['size']); side = p['side']
             notional = size * current_price
             if current_price and entry:
-                if side == "LONG":
-                    unreal_usd = (current_price - entry) * size
-                    unreal_pct = ((current_price - entry) / entry) * 100
-                else:
-                    unreal_usd = (entry - current_price) * size
-                    unreal_pct = ((entry - current_price) / entry) * 100
+                unreal_usd = _pos_pnl(p, current_price)
+                unreal_pct = (unreal_usd / (size * entry)) * 100
                 usign2 = "+" if unreal_usd >= 0 else ""
                 funding = all_data.get(sym, {}).get('oi', {}).get('funding', 0)
                 logger.info(
