@@ -1,13 +1,5 @@
-TOP_N = 20
-PINNED = [
-    # Core crypto
-    "BTC", "ETH", "SOL", "HYPE",
-    # Commodities
-    "XAU",   # gold
-    "WTI",   # crude oil
-    # Top liquid equity perps
-    "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META",
-]
+TOP_N = 10
+PINNED = ["BTC", "ETH", "SOL", "HYPE"]
 STABLECOINS = {
     # USD-pegged
     "USDC", "USDC0", "USDT", "USDT0", "USDHL",
