@@ -10,9 +10,9 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from config import (
-    TOP_N, STABLECOINS, MAX_POSITIONS, MAX_POSITIONS_PER_DEX, LEVERAGE, INTERVAL_MINUTES,
+    TOP_N, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS,
-    RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_PORTFOLIO_RISK_PCT_PER_DEX,
+    RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT,
     MIN_NOTIONAL_USD, STOP_ATR_MULT,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_PCT,
     TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG,
@@ -40,9 +40,8 @@ from signals import (
 )
 from exchange import (
     mainnet_info, exchange as hl_exchange,
-    DEXES, dex_of, get_all_mids, meta_and_ctxs, get_book,
-    place_alo_limit, cancel_order, get_open_positions,
-    get_equity_by_dex,
+    get_all_mids, get_book,
+    place_alo_limit, cancel_order, get_open_positions, get_equity,
 )
 
 load_dotenv()
@@ -93,38 +92,30 @@ def sleep_until_next_hour():
 
 def build_volume_ranking():
     """
-    Fetch 30-day daily candles for non-stablecoin symbols on the standard perp dex
-    and compute average daily dollar volume (v × close). Pre-filters by 24h vol to
-    bound API calls. Results cached in VOLUME_RANK_LOG.
+    Fetch 30-day daily candles for non-stablecoin symbols on the perp dex and
+    compute average daily dollar volume (v × close). Pre-filters to the top-50 by
+    24h vol to bound API calls. Results cached in VOLUME_RANK_LOG.
     Returns [[symbol, avg_vol_usd], ...] sorted descending.
-
-    Universe is standard-dex only: xyz HIP-3 perps are excluded since the xyz
-    position cap is 0 (see MAX_POSITIONS_PER_DEX) — including them would crowd out
-    tradeable std names and waste API calls. The dual-dex plumbing in exchange.py
-    remains so any pre-existing xyz position is still managed by the stop logic.
     """
-    logger.info("Building 30-day avg volume ranking (standard dex, runs once per day)...")
+    logger.info("Building 30-day avg volume ranking (runs once per day)...")
     end_ms   = int(time.time() * 1000)
     start_ms = end_ms - 30 * 24 * 60 * 60 * 1000
 
-    # Candidate pool, pre-sorted by 24h vol. Standard dex is large so cap to top-50.
-    candidates = []
-    for dex, cap in (("", 50),):
-        try:
-            meta_ctxs = meta_and_ctxs(dex)
-            universe, ctxs = meta_ctxs[0]['universe'], meta_ctxs[1]
-        except Exception as e:
-            logger.warning(f"Volume rank: meta fetch for dex={dex!r} failed — {e}")
-            continue
-        dex_cands = []
-        for i, asset in enumerate(universe):
-            name = asset['name']
-            if name.upper() in STABLECOINS or i >= len(ctxs):
-                continue
-            dex_cands.append((name, float(ctxs[i].get('dayNtlVlm', 0))))
-        dex_cands.sort(key=lambda x: x[1], reverse=True)
-        candidates += dex_cands[:cap] if cap else dex_cands
+    try:
+        meta_ctxs = mainnet_info.meta_and_asset_ctxs()
+        universe, ctxs = meta_ctxs[0]['universe'], meta_ctxs[1]
+    except Exception as e:
+        logger.error(f"Volume rank: meta fetch failed — {e}")
+        return []
+
+    # Candidate pool, pre-sorted by 24h vol, capped to top-50 to bound API calls.
+    candidates = [
+        (a['name'], float(ctxs[i].get('dayNtlVlm', 0)))
+        for i, a in enumerate(universe)
+        if a['name'].upper() not in STABLECOINS and i < len(ctxs)
+    ]
     candidates.sort(key=lambda x: x[1], reverse=True)
+    candidates = candidates[:50]
 
     def fetch_30d(sym):
         try:
@@ -172,7 +163,7 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
                 top.append(sym)
                 logger.info(f"  Keeping {sym} (open position)")
 
-        logger.info(f"Top {top_n} mainnet perps (std + xyz) by 30-day avg $ volume:")
+        logger.info(f"Top {top_n} mainnet perps by 30-day avg $ volume:")
         for rank, (sym, vol) in enumerate(ranking[:top_n], 1):
             logger.info(f"  #{rank} {sym}: ${vol:,.0f}/day")
 
@@ -212,8 +203,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
 
             price = float(_mids[symbol])
 
-            # szDecimals via the dual-dex SDK map so xyz: symbols resolve correctly
-            # (asset_ctxs passed in is standard-dex only and misses xyz names).
+            # szDecimals via the SDK's loaded asset map
             try:
                 sz_decimals = mainnet_info.asset_to_sz_decimals[mainnet_info.name_to_asset(symbol)]
             except Exception:
@@ -297,14 +287,11 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
 def get_all_market_data(symbols, open_position_syms=None):
     open_position_syms = open_position_syms or set()
     logger.info("Fetching market data + orderflow for selected symbols (parallel)...")
-    # Per-dex asset contexts (funding) — xyz funding lives in the xyz dex ctxs.
-    ctxs_by_dex = {}
-    for d in DEXES:
-        try:
-            ctxs_by_dex[d] = meta_and_ctxs(d)
-        except Exception as e:
-            logger.warning(f"Could not pre-fetch asset contexts dex={d!r} — funding unavailable: {e}")
-            ctxs_by_dex[d] = None
+    asset_ctxs = None
+    try:
+        asset_ctxs = mainnet_info.meta_and_asset_ctxs()
+    except Exception as e:
+        logger.warning(f"Could not pre-fetch asset contexts — funding unavailable this cycle: {e}")
     mids = None
     try:
         mids = get_all_mids()
@@ -314,7 +301,7 @@ def get_all_market_data(symbols, open_position_syms=None):
     failed = []
     with ThreadPoolExecutor(max_workers=3) as executor:  # lowered to ease CloudFront rate limits
         futures = {
-            executor.submit(get_symbol_data, sym, 3, 5, ctxs_by_dex.get(dex_of(sym)), mids): sym
+            executor.submit(get_symbol_data, sym, 3, 5, asset_ctxs, mids): sym
             for sym in symbols
         }
         for future in as_completed(futures):
@@ -549,7 +536,7 @@ def check_pending_loc(positions, all_data, equity):
             if sym_data is None:
                 logger.warning(f"{symbol}: not in all_data this cycle — fetching individually for LOC finalization")
                 try:
-                    fallback_ctxs = meta_and_ctxs(dex_of(symbol))  # dex-correct ctxs so funding is right for xyz:
+                    fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
                 except Exception:
                     fallback_ctxs = None
                 sym_data = get_symbol_data(symbol, asset_ctxs=fallback_ctxs) or {}
@@ -715,7 +702,7 @@ def check_stops(positions, all_data, equity):
             logger.warning(f"Stop check: {sym} missing from market data — attempting individual fetch")
             send_telegram(f"⚠️ <b>{sym}: market data missing</b>\nStop checks skipped — retrying fetch individually")
             try:
-                fallback_ctxs = meta_and_ctxs(dex_of(sym))  # dex-correct ctxs so funding is right for xyz:
+                fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
             except Exception:
                 fallback_ctxs = None
             data = get_symbol_data(sym, asset_ctxs=fallback_ctxs)
@@ -1192,28 +1179,27 @@ def run_bot():
             _lf.write(str(os.getpid()))
     atexit.register(lambda: os.path.exists(lockfile) and os.remove(lockfile))
 
-    caps_str = " ".join(f"{d or 'std'}={n}" for d, n in MAX_POSITIONS_PER_DEX.items())
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
-    logger.info(f"Dynamic selection: TOP {TOP_N} mainnet perps (std + xyz) by 30-day avg daily dollar volume")
+    logger.info(f"Dynamic selection: TOP {TOP_N} mainnet perps by 30-day avg daily dollar volume")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
     logger.info(f"Exits: ST against position | ADX decay <{ADX_DECAY_EXIT} | chandelier {STOP_ATR_MULT}×ATR + struct stop")
-    logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | per-dex portfolio caps | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")
+    logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")
     logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +{STOP_ATR_MULT}×ATR")
-    logger.info(f"Leverage: {LEVERAGE}x | Max positions per dex: {caps_str}")
-    logger.info(f"Trading: MAINNET (std + xyz dexes) | Interval: {INTERVAL_MINUTES}min ({INTERVAL_MINUTES//60}h, UTC-aligned)")
+    logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS}")
+    logger.info(f"Trading: MAINNET | Interval: {INTERVAL_MINUTES}min ({INTERVAL_MINUTES//60}h, UTC-aligned)")
 
     init_files()
     if not load_json(START_EQUITY_LOG, None):
-        first_eq = sum(get_equity_by_dex().values())
+        first_eq = get_equity()
         if first_eq > 0:
             save_json(START_EQUITY_LOG, {"equity": first_eq, "recorded_at": datetime.now().isoformat()})
             logger.info(f"Start equity recorded: ${first_eq:.2f}")
     send_telegram(
         "🤖 <b>Trading Bot Started</b>\n"
-        f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max/dex {caps_str}\n"
+        f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max {MAX_POSITIONS}\n"
         f"Entries: rule-based (ST + ADX + pullback) | Post-only maker\n"
         f"Exits: ST against position | ADX decay | chandelier {STOP_ATR_MULT}×ATR\n"
-        "Trading: MAINNET (std + xyz dexes)"
+        "Trading: MAINNET"
     )
 
     while True:
@@ -1223,74 +1209,59 @@ def run_bot():
             positions = get_open_positions()
             symbols   = get_top_symbols(TOP_N, extra_symbols=list(positions.keys()))
             all_data  = get_all_market_data(symbols, open_position_syms=set(positions.keys()))
-            equity_by_dex = get_equity_by_dex()
-            total_equity  = sum(equity_by_dex.values())
+            equity = get_equity()
+            if equity <= 0:
+                equity = get_equity()   # one retry on transient API failure
 
-            eq_str = " ".join(f"{d or 'std'}=${equity_by_dex.get(d, 0):.2f}" for d in DEXES)
-            logger.info(f"Equity by dex: {eq_str} | Open positions: {len(positions)}")
+            logger.info(f"Equity: ${equity:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
 
             # ── Step 0: Resolve pending LOC orders from last cycle ─────────────
             positions = get_open_positions()   # refresh — LOC may have filled during market data fetch
-            check_pending_loc(positions, all_data, total_equity)
+            check_pending_loc(positions, all_data, equity)
 
-            if total_equity > 0:
-                log_equity(total_equity, all_data, positions)
+            if equity > 0:
+                log_equity(equity, all_data, positions)
 
             # ── Step 1: Automatic stops ────────────────────────────────────────
             if positions:
-                stopped = check_stops(positions, all_data, total_equity)
+                stopped = check_stops(positions, all_data, equity)
                 if stopped:
                     time.sleep(SETTLE_SECONDS)
                     positions = get_open_positions()
-            equity_by_dex = get_equity_by_dex()  # refresh before entry decision
+            equity = get_equity()  # refresh before entry decision
 
-            # ── Step 2: Per-dex LOC entry — one entry per dex per cycle ─────────
-            # Each dex (standard "" / xyz HIP-3) is an isolated sub-portfolio with
-            # its own equity, position cap, and heat cap.
+            # ── Step 2: LOC entry (only if slot available, no pending order, heat OK)
             pending_syms = set(_load_pending_loc().keys())
-            for d in DEXES:
-                # Reload peaks each iteration: an immediate LOC fill in a prior dex's
-                # iteration calls init_peak, so a once-before-the-loop load would be stale.
-                peaks = _load_peaks()
-                eq_d = equity_by_dex.get(d, 0.0)
-                if eq_d <= 0:
-                    continue  # no collateral on this dex — can't size/enter (positions still managed by stops)
-                pos_d  = {s: p for s, p in positions.items() if dex_of(s) == d}
-                pend_d = {s for s in pending_syms if dex_of(s) == d}
-                cap_d  = MAX_POSITIONS_PER_DEX.get(d, 0)
-                if len(pend_d) + len(pos_d) >= cap_d:
-                    continue
-                logger.info(f"[{d or 'std'}] scanning for entry (eq=${eq_d:.2f}, slots {len(pend_d)+len(pos_d)}/{cap_d})...")
+            if len(pending_syms) + len(positions) < MAX_POSITIONS:
+                logger.info("Scanning for entry setups...")
                 # Treat pending symbols as taken slots so select_entry skips them
-                occupied = {**pos_d, **{s: {"side": "PENDING"} for s in pend_d}}
-                data_d   = {s: v for s, v in all_data.items() if dex_of(s) == d}
-                entry_sym, is_long, pb_reason = select_entry(data_d, occupied)
-                if not entry_sym:
-                    continue
-                # Open-position risk: full STOP_ATR_MULT×ATR even for BE-locked trades.
-                # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
-                # Prospective entry: +1 trade's worth so we can't step over the cap.
-                open_risk = sum(
-                    abs(p['size']) * (peaks.get(s, {}).get('atr') or all_data.get(s, {}).get('atr') or 0) * STOP_ATR_MULT
-                    for s, p in pos_d.items()
-                )
-                open_risk += (len(pend_d) + 1) * RISK_PER_TRADE_PCT * eq_d
-                heat_pct = open_risk / eq_d if eq_d > 0 else 0
-                cap_pct  = MAX_PORTFOLIO_RISK_PCT_PER_DEX.get(d, MAX_PORTFOLIO_RISK_PCT)
-                logger.info(f"[{d or 'std'}] heat: ${open_risk:.2f} = {heat_pct*100:.1f}% of dex equity (cap {cap_pct*100:.0f}%)")
-                if heat_pct >= cap_pct:
-                    logger.info(f"[{d or 'std'}] heat {heat_pct*100:.1f}% ≥ {cap_pct*100:.0f}% cap — skipping {entry_sym}")
-                    continue
-                # Advisory log AFTER the heat gate so blocked setups don't incur API cost
-                try:
-                    log_advisor_verdict(entry_sym, is_long, pb_reason, all_data.get(entry_sym, {}))
-                except Exception as e:
-                    logger.warning(f"AI advisor hook failed (non-blocking): {e}")
-                place_loc_order(entry_sym, is_long, all_data, eq_d, pb_reason)
+                occupied = {**positions, **{sym: {"side": "PENDING"} for sym in pending_syms}}
+                entry_sym, is_long, pb_reason = select_entry(all_data, occupied)
+                if entry_sym:
+                    peaks = _load_peaks()
+                    # Open-position risk: full STOP_ATR_MULT×ATR even for BE-locked trades.
+                    # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
+                    # Prospective entry: +1 trade's worth so we can't step over the cap.
+                    open_risk = sum(
+                        abs(p['size']) * (peaks.get(sym, {}).get('atr') or all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
+                        for sym, p in positions.items()
+                    )
+                    open_risk += (len(pending_syms) + 1) * RISK_PER_TRADE_PCT * equity
+                    heat_pct = open_risk / equity if equity > 0 else 0
+                    logger.info(f"Portfolio heat: ${open_risk:.2f} = {heat_pct*100:.1f}% of equity")
+                    if heat_pct >= MAX_PORTFOLIO_RISK_PCT:
+                        logger.info(f"Heat {heat_pct*100:.1f}% ≥ {MAX_PORTFOLIO_RISK_PCT*100:.0f}% cap — skipping {entry_sym}")
+                    else:
+                        # Advisory log AFTER the heat gate so blocked setups don't incur API cost
+                        try:
+                            log_advisor_verdict(entry_sym, is_long, pb_reason, all_data.get(entry_sym, {}))
+                        except Exception as e:
+                            logger.warning(f"AI advisor hook failed (non-blocking): {e}")
+                        place_loc_order(entry_sym, is_long, all_data, equity, pb_reason)
 
-            positions    = get_open_positions()
-            total_equity = sum(get_equity_by_dex().values())
-            print_summary(total_equity, positions, all_data)
+            positions = get_open_positions()
+            equity    = get_equity()
+            print_summary(equity, positions, all_data)
 
             sleep_until_next_hour()
 

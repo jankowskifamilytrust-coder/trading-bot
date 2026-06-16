@@ -9,9 +9,6 @@ from datetime import datetime
 
 sys.path.insert(0, '/Users/marekjankowski/trading-bot')
 
-from hyperliquid.info import Info
-from hyperliquid.utils import constants
-
 from exchange import mainnet_info
 from signals import (
     compute_supertrend, compute_adx, compute_atr,
@@ -24,18 +21,9 @@ from config import (
     RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_BAND_PCT, EMA_PERIOD, VOLUME_CONFIRM_RATIO,
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_POSITIONS,
-    MAX_POSITIONS_PER_DEX,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_USD, MIN_NOTIONAL_PCT,
     FUNDING_LONG_MAX, FUNDING_SHORT_MIN,
 )
-
-# When True, model the live bot's per-dex position caps (e.g. std<=3, xyz<=1)
-# on the shared equity pool instead of one global MAX_POSITIONS gate.
-USE_PER_DEX_CAPS = False
-
-
-def _dex_of(sym):
-    return "xyz" if sym.startswith("xyz:") else ""
 
 INITIAL_EQUITY = 10000.0
 LOOKBACK_DAYS  = 5 * 365 + 90  # 5 years of daily data + warmup buffer
@@ -46,15 +34,6 @@ LEVERAGE       = 2             # cosmetic — used only for log display
 # held. Disabled by default (thresholds outside any real funding rate).
 FUNDING_EXIT_LONG_MAX  = 1.0
 FUNDING_EXIT_SHORT_MIN = -1.0
-
-# "xyz" is Hyperliquid's HIP-3 builder-deployed dex carrying stock/index/
-# commodity/forex perps (e.g. xyz:AAPL, xyz:GOLD). Backtest-only — the live
-# bot and exchange.py stay on the main "" dex.
-XYZ_INFO = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", "xyz"])
-
-
-def info_for(sym):
-    return XYZ_INFO if sym.startswith("xyz:") else mainnet_info
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -69,7 +48,7 @@ def closed_before(candle_list, cutoff_ms):
 
 # ── Data Fetching ─────────────────────────────────────────────────────────────
 
-def get_top_symbols(n=TOP_N, include_xyz=False):
+def get_top_symbols(n=TOP_N):
     print("Ranking symbols by 30-day avg daily volume...")
     end   = int(time.time() * 1000)
     start = end - 30 * 24 * 60 * 60 * 1000
@@ -82,21 +61,11 @@ def get_top_symbols(n=TOP_N, include_xyz=False):
         if a['name'].upper() not in STABLECOINS and i < len(ctxs)
     ]
 
-    if include_xyz:
-        xyz_meta = XYZ_INFO.post("/info", {"type": "metaAndAssetCtxs", "dex": "xyz"})
-        xyz_universe, xyz_ctxs = xyz_meta[0]['universe'], xyz_meta[1]
-        candidates += [
-            (a['name'], float(xyz_ctxs[i].get('dayNtlVlm', 0)))
-            for i, a in enumerate(xyz_universe)
-            if i < len(xyz_ctxs)
-        ]
-
     candidates.sort(key=lambda x: x[1], reverse=True)
-    pool_size = 30 + (30 if include_xyz else 0)
     results = []
-    for sym, _ in candidates[:pool_size]:
+    for sym, _ in candidates[:30]:
         try:
-            c = info_for(sym).candles_snapshot(sym, "1d", start, end)
+            c = mainnet_info.candles_snapshot(sym, "1d", start, end)
             avg = sum(float(x['v']) * float(x['c']) for x in c) / len(c) if c else 0
             results.append((sym, avg))
         except Exception:
@@ -120,7 +89,7 @@ def fetch_chunked(sym, interval, start_ms, end_ms, chunk_hours=4800, retries=4, 
         window_end = min(window_start + chunk_ms, end_ms)
         for attempt in range(retries):
             try:
-                chunk = info_for(sym).candles_snapshot(sym, interval, window_start, window_end)
+                chunk = mainnet_info.candles_snapshot(sym, interval, window_start, window_end)
                 all_candles.extend(chunk)
                 break
             except Exception as e:
@@ -152,7 +121,7 @@ def fetch_candles(symbols):
     for sym in symbols:
         print(f"  {sym} ...", end='', flush=True)
         try:
-            daily[sym] = info_for(sym).candles_snapshot(sym, "1d", start, end)
+            daily[sym] = mainnet_info.candles_snapshot(sym, "1d", start, end)
             h4[sym]    = fetch_chunked(sym, "4h", start, end, chunk_hours=4800*4)
             print(f" {len(daily[sym])}d / {len(h4[sym])} 4h")
         except Exception as e:
@@ -170,7 +139,7 @@ def fetch_funding_chunked(sym, start_ms, end_ms, chunk_hours=480, retries=4, pau
         window_end = min(window_start + chunk_ms, end_ms)
         for attempt in range(retries):
             try:
-                chunk = info_for(sym).funding_history(sym, window_start, window_end)
+                chunk = mainnet_info.funding_history(sym, window_start, window_end)
                 all_events.extend(chunk)
                 break
             except Exception as e:
@@ -508,19 +477,7 @@ def run(symbols, daily, h4, funding=None):
 
         # ── Check entries ──────────────────────────────────────────────────
         occupied = set(positions.keys()) | set(pending_loc.keys())
-        if USE_PER_DEX_CAPS:
-            occ_by_dex = {}
-            for s in occupied:
-                d = _dex_of(s)
-                occ_by_dex[d] = occ_by_dex.get(d, 0) + 1
-            total_cap = sum(MAX_POSITIONS_PER_DEX.values())
-            cap_ok    = len(occupied) < total_cap
-            heat_cap  = total_cap * RISK_PER_TRADE_PCT
-        else:
-            cap_ok   = len(occupied) < MAX_POSITIONS
-            heat_cap = MAX_PORTFOLIO_RISK_PCT
-
-        if cap_ok:
+        if len(occupied) < MAX_POSITIONS:
             # Heat check
             open_risk = sum(
                 abs(p['size']) * (p['entry_atr'] or 0) * STOP_ATR_MULT
@@ -529,15 +486,11 @@ def run(symbols, daily, h4, funding=None):
             open_risk += (len(pending_loc) + 1) * RISK_PER_TRADE_PCT * equity
             heat = open_risk / equity if equity > 0 else 0
 
-            if heat < heat_cap:
+            if heat < MAX_PORTFOLIO_RISK_PCT:
                 candidates = []
                 for sym in symbols:
                     if sym in occupied:
                         continue
-                    if USE_PER_DEX_CAPS:
-                        d = _dex_of(sym)
-                        if occ_by_dex.get(d, 0) >= MAX_POSITIONS_PER_DEX.get(d, 0):
-                            continue  # this dex's slots are full
                     sig = sigs.get(sym)
                     if not sig:
                         continue
@@ -707,12 +660,11 @@ if __name__ == "__main__":
     t0 = time.time()
 
     args = sys.argv[1:]
-    include_xyz = "--xyz" in args
     no_funding = "--no-funding" in args
-    args = [a for a in args if a not in ("--xyz", "--no-funding")]
+    args = [a for a in args if a not in ("--no-funding",)]
     n = int(args[0]) if args else TOP_N
 
-    symbols = get_top_symbols(n, include_xyz=include_xyz)
+    symbols = get_top_symbols(n)
     daily, h4 = fetch_candles(symbols)
 
     funding = None

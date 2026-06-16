@@ -11,45 +11,18 @@ from loguru import logger
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
 
-# MAINNET-only, dual-dex: the standard perp dex ("") and the xyz HIP-3 builder
-# dex. Building Info/Exchange with perp_dexs=["", "xyz"] lets a single object
-# serve candles for both dexes and auto-route order()/market_close()/
-# update_leverage()/l2_snapshot() to the right dex off the "xyz:" name prefix.
-# Note: all_mids() and user_state() are per-dex and take a dex= argument.
-mainnet_info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", "xyz"])
-exchange = Exchange(wallet, constants.MAINNET_API_URL, perp_dexs=["", "xyz"])
-
-DEXES = ["", "xyz"]
-
-
-def dex_of(sym):
-    """Dex a symbol trades on, derived from its name prefix."""
-    return "xyz" if sym.startswith("xyz:") else ""
+# MAINNET, standard perp dex only.
+mainnet_info = Info(constants.MAINNET_API_URL, skip_ws=True)
+exchange = Exchange(wallet, constants.MAINNET_API_URL)
 
 
 def get_all_mids():
-    """Merged mid-price map across both dexes. xyz keys keep the 'xyz:' prefix,
-    so there is no key collision with standard symbols."""
-    mids = {}
-    for d in DEXES:
-        try:
-            mids.update(mainnet_info.all_mids(dex=d))
-        except Exception as e:
-            logger.warning(f"all_mids dex={d!r} failed: {e}")
-    return mids
-
-
-def meta_and_ctxs(dex=""):
-    """Return [meta, asset_ctxs] for a dex. Standard uses the SDK helper; xyz
-    uses a raw /info post (the SDK helper is standard-dex only)."""
-    if dex == "":
-        return mainnet_info.meta_and_asset_ctxs()
-    return mainnet_info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+    """Mid-price map for the standard perp dex."""
+    return mainnet_info.all_mids()
 
 
 def get_book(symbol):
-    """Return (best_bid, best_ask, tick, decimals) from the mainnet L2 book.
-    l2_snapshot resolves xyz: symbols via the dual-dex name map."""
+    """Return (best_bid, best_ask, tick, decimals) from the mainnet L2 book."""
     try:
         l2 = mainnet_info.l2_snapshot(symbol)
         bids = l2['levels'][0]
@@ -114,24 +87,21 @@ def cancel_order(symbol, oid):
 _last_positions: dict = {}
 
 def get_open_positions():
-    """All open positions across both dexes, flat dict keyed by symbol (xyz: keys
-    carry the prefix). Each entry tagged with its 'dex' for per-dex grouping."""
+    """All open positions, flat dict keyed by symbol."""
     global _last_positions
     positions = {}
     try:
-        for d in DEXES:
-            state = mainnet_info.user_state(wallet.address, dex=d)
-            for p in state.get('assetPositions', []):
-                pos = p.get('position', {})
-                coin = pos.get('coin')
-                size = float(pos.get('szi', 0))
-                entry = float(pos.get('entryPx', 0))
-                if size != 0:
-                    positions[coin] = {
-                        "size": size, "entry": entry,
-                        "side": "LONG" if size > 0 else "SHORT",
-                        "dex": d,
-                    }
+        state = mainnet_info.user_state(wallet.address)
+        for p in state.get('assetPositions', []):
+            pos = p.get('position', {})
+            coin = pos.get('coin')
+            size = float(pos.get('szi', 0))
+            entry = float(pos.get('entryPx', 0))
+            if size != 0:
+                positions[coin] = {
+                    "size": size, "entry": entry,
+                    "side": "LONG" if size > 0 else "SHORT",
+                }
         _last_positions = positions
         return positions
     except Exception as e:
@@ -139,18 +109,13 @@ def get_open_positions():
         return _last_positions
 
 
-def get_equity(dex=""):
-    """Account value for a single dex (HIP-3 dexes have isolated clearinghouses)."""
+def get_equity():
+    """Account value for the standard perp dex."""
     try:
-        user_state = mainnet_info.user_state(wallet.address, dex=dex)
+        user_state = mainnet_info.user_state(wallet.address)
         return float(user_state['marginSummary']['accountValue'])
     except Exception as e:
-        logger.error(f"Equity read error (dex={dex!r}): {e}")
+        logger.error(f"Equity read error: {e}")
         return 0.0
-
-
-def get_equity_by_dex():
-    """Per-dex equity map, e.g. {'': 1234.0, 'xyz': 56.0}."""
-    return {d: get_equity(d) for d in DEXES}
 
 

@@ -8,9 +8,7 @@ from hyperliquid.utils import constants
 
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
-# MAINNET, dual-dex. user_fills / user_funding_history are account-wide (no dex
-# param), so a single dual-dex Info covers both standard and xyz activity.
-info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", "xyz"])
+info = Info(constants.MAINNET_API_URL, skip_ws=True)
 addr = wallet.address
 
 def f(x, default=0.0):

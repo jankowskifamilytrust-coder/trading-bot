@@ -7,32 +7,28 @@ from hyperliquid.utils import constants
 
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
-# MAINNET, dual-dex: standard ("") + xyz HIP-3 (isolated clearinghouses).
-DEXES = ["", "xyz"]
-info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=DEXES)
+info = Info(constants.MAINNET_API_URL, skip_ws=True)
 
 print("=" * 50)
 print("Wallet address:", wallet.address)
-print("MAINNET (std + xyz dexes)")
+print("MAINNET")
 print("=" * 50)
 
-states = {}
-for dex in DEXES:
-    state = info.user_state(wallet.address, dex=dex)
-    states[dex] = state
-    label = dex or "std"
-    print(f"\n[{label}] Account value:", state.get('marginSummary', {}).get('accountValue'))
-    positions = [p for p in state.get('assetPositions', [])
-                 if float(p.get('position', {}).get('szi', 0)) != 0]
-    if not positions:
-        print(f"  [{label}] NONE — no open positions")
-    for p in positions:
-        pos = p.get('position', {})
-        print(f"  [{label}] {pos.get('coin')}: size={pos.get('szi')} entry={pos.get('entryPx')}")
+state = info.user_state(wallet.address)
+
+print("\nAccount value:", state.get('marginSummary', {}).get('accountValue'))
+print("\nOpen positions:")
+positions = [p for p in state.get('assetPositions', [])
+             if float(p.get('position', {}).get('szi', 0)) != 0]
+if not positions:
+    print("  NONE — account has no open positions")
+for p in positions:
+    pos = p.get('position', {})
+    print(f"  {pos.get('coin')}: size={pos.get('szi')} entry={pos.get('entryPx')}")
 
 print("\n" + "=" * 50)
-print("FULL RAW STATE (per dex):")
-print(json.dumps(states, indent=2))
+print("FULL RAW STATE:")
+print(json.dumps(state, indent=2))
 
 print("\n" + "=" * 50)
 print("SPOT BALANCES:")
@@ -42,11 +38,9 @@ for b in spot.get('balances', []):
 print("=" * 50)
 
 print("\n" + "=" * 50)
-print("MAINNET TRADEABLE PERPS (std + xyz):")
-for dex in DEXES:
-    meta = info.post("/info", {"type": "meta", "dex": dex}) if dex else info.meta()
-    names = [a['name'] for a in meta['universe']]
-    print(f"  [{dex or 'std'}] {len(names)} perps")
+print("MAINNET TRADEABLE PERPS:")
+names = [a['name'] for a in info.meta()['universe']]
+print(f"  {len(names)} perps")
 print("=" * 50)
 
 os._exit(0)

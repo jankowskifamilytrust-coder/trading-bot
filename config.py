@@ -11,20 +11,14 @@ STABLECOINS = {
     "EURS", "EURC", "AGEUR", "EURT",
 }
 
-MAX_POSITIONS = 3              # standard-dex cap (kept for back-references); see MAX_POSITIONS_PER_DEX
+MAX_POSITIONS = 3
 LEVERAGE = 2
 INTERVAL_MINUTES = 240   # 4h cycle — entry triggers computed on closed 4h bars (matches backtest)
 SLIPPAGE = 0.05          # max slippage for market stop-out orders — large intentionally for guaranteed fills
 SETTLE_SECONDS = 3
 
-# Per-dex position caps. HIP-3 (xyz) uses an isolated clearinghouse, so each dex
-# is its own sub-portfolio. Standard keeps the backtested cap of 3; xyz capped at 1.
-MAX_POSITIONS_PER_DEX = {"": 3, "xyz": 0}
-
 RISK_PER_TRADE_PCT   = 0.025   # fraction of equity risked per stop-out
-MAX_PORTFOLIO_RISK_PCT = 0.075  # standard-dex heat cap (kept for back-references); see *_PER_DEX
-# Per-dex heat cap = that dex's position cap × per-trade risk, evaluated against that dex's equity.
-MAX_PORTFOLIO_RISK_PCT_PER_DEX = {d: n * RISK_PER_TRADE_PCT for d, n in MAX_POSITIONS_PER_DEX.items()}
+MAX_PORTFOLIO_RISK_PCT = 0.075  # total open-risk cap before new entries are blocked (3 × RISK_PER_TRADE_PCT)
 MIN_NOTIONAL_USD = 20
 MAX_NOTIONAL_PCT = 0.30   # equity-relative ceiling — 30% of equity per trade
 MIN_NOTIONAL_PCT = 0.02   # equity-relative floor (skip rather than inflate)
