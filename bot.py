@@ -10,6 +10,7 @@ from config import (
     TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
+    MAX_NOTIONAL_PCT, MIN_NOTIONAL_PCT,
     TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG,
     VOLUME_RANK_LOG, VOLUME_RANK_TTL_HOURS,
     SUPERTREND_PERIOD, SUPERTREND_MULT,
@@ -328,23 +329,45 @@ def get_all_market_data(symbols, open_position_syms=None):
 # ─── Position Sizing ──────────────────────────────────────────────────────────
 
 def compute_notional(symbol, all_data, equity):
-    """Size position so a stop-out costs exactly RISK_PER_TRADE_PCT of equity."""
+    """
+    ATR-based sizing: risk exactly RISK_PER_TRADE_PCT of equity per stop-out.
+    Returns (None, None) to signal skip — callers must handle this.
+
+    Cap  : min(ATR-sized, equity×MAX_NOTIONAL_PCT, MAX_NOTIONAL_USD) — fails safe.
+    Floor: skip rather than inflate — preserves the 1% guarantee.
+    """
     atr   = all_data[symbol].get('atr')
     price = all_data[symbol].get('tn_price') or all_data[symbol].get('price', 0)
-    if atr and price and atr > 0:
-        dollar_risk   = equity * RISK_PER_TRADE_PCT
-        stop_distance = STOP_ATR_MULT * atr
-        size_tokens   = dollar_risk / stop_distance
-        notional      = size_tokens * price
-        notional      = min(notional, MAX_NOTIONAL_USD)
-        notional      = max(notional, MIN_NOTIONAL_USD)
-        logger.info(
-            f"ATR sizing {symbol}: ATR=${atr:.4f} | stop=${stop_distance:.4f} | "
-            f"risk ${dollar_risk:.2f} → {size_tokens:.4f} tok → ${notional:.2f} notional"
+    if not atr or not price or atr <= 0:
+        logger.warning(f"{symbol}: no ATR data — skipping")
+        return None, None
+
+    dollar_risk   = equity * RISK_PER_TRADE_PCT
+    stop_distance = STOP_ATR_MULT * atr
+    size_tokens   = dollar_risk / stop_distance
+    notional      = size_tokens * price
+
+    if dollar_risk < 1.0:
+        logger.warning(
+            f"{symbol}: dollar risk ${dollar_risk:.2f} < $1.00 — skipping (equity too small for fees)"
         )
-        return notional, atr
-    logger.warning(f"{symbol}: no ATR data — using max notional ${MAX_NOTIONAL_USD:.2f}")
-    return MAX_NOTIONAL_USD, None
+        return None, None
+
+    notional = min(notional, equity * MAX_NOTIONAL_PCT, MAX_NOTIONAL_USD)
+
+    floor = max(equity * MIN_NOTIONAL_PCT, MIN_NOTIONAL_USD)
+    if notional < floor:
+        logger.warning(
+            f"{symbol}: notional ${notional:.2f} < floor ${floor:.2f} "
+            f"(ATR too large — skip rather than inflate)"
+        )
+        return None, None
+
+    logger.info(
+        f"ATR sizing {symbol}: ATR=${atr:.4f} | stop=${stop_distance:.4f} | "
+        f"risk ${dollar_risk:.2f} → {size_tokens:.4f} tok → ${notional:.2f} notional"
+    )
+    return notional, atr
 
 # ─── Entry (post-only maker) ──────────────────────────────────────────────────
 
@@ -357,6 +380,9 @@ def open_position(symbol, is_buy, all_data, equity,
     sz_decimals = all_data[symbol].get('sz_decimals', 3)
     notional_usd, atr_val = compute_notional(symbol, all_data, equity)
     direction = "LONG" if is_buy else "SHORT"
+    if notional_usd is None:
+        send_telegram(f"⏭️ <b>{symbol} {direction} skipped</b>\nCannot size position safely — see logs")
+        return False
 
     try:
         hl_exchange.update_leverage(LEVERAGE, symbol, is_cross=True)
@@ -587,6 +613,8 @@ def place_loc_order(symbol, is_long, all_data, equity):
         return False
 
     notional_usd, atr_val = compute_notional(symbol, all_data, equity)
+    if notional_usd is None:
+        return False
 
     try:
         hl_exchange.update_leverage(LEVERAGE, symbol, is_cross=True)
