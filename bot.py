@@ -1,5 +1,6 @@
 import os
 import atexit
+import math
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -595,8 +596,17 @@ def place_loc_order(symbol, is_long, all_data, equity):
         logger.error(f"{symbol}: no book — cannot place LOC order")
         return False
 
-    limit_px = round(ema_val, decimals)
-    # Post-only orders must rest on the maker side — skip if EMA would cross the book
+    # Snap to tick grid, then enforce Hyperliquid's ≤5 significant-figure rule.
+    # Rounding to the book's decimal count alone doesn't guarantee tick alignment
+    # or the sig-fig constraint, and either violation causes an order rejection.
+    snapped = round(ema_val / tick) * tick if tick > 0 else ema_val
+    if snapped > 0:
+        mag = int(math.log10(snapped)) + 1      # digits left of decimal point
+        limit_px = round(snapped, max(0, 5 - mag))
+    else:
+        limit_px = round(snapped, decimals)     # fallback for sub-cent prices
+    # Defence-in-depth: C3 tightening makes crossing unreachable in normal flow,
+    # but guard remains for any edge case that slips through.
     if is_long and limit_px > best_bid:
         logger.info(
             f"{symbol} LONG LOC: EMA ${limit_px:.{decimals}f} > bid ${best_bid:.{decimals}f} "
@@ -679,8 +689,17 @@ def check_stops(positions, all_data, equity):
     for sym, p in list(positions.items()):
         data = all_data.get(sym)
         if not data:
-            logger.warning(f"Stop check: no market data for {sym} — skipping")
-            continue
+            logger.warning(f"Stop check: {sym} missing from market data — attempting individual fetch")
+            send_telegram(f"⚠️ <b>{sym}: market data missing</b>\nStop checks skipped — retrying fetch individually")
+            try:
+                fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
+            except Exception:
+                fallback_ctxs = None
+            data = get_symbol_data(sym, asset_ctxs=fallback_ctxs)
+            if not data:
+                logger.error(f"Stop check: fallback fetch failed for {sym} — position unmanaged this cycle")
+                continue
+            all_data[sym] = data
         atr   = data.get('atr')
         price = data.get('tn_price') or data.get('price')
         entry = p['entry']
@@ -929,8 +948,9 @@ def _check_pullback_entry(symbol, all_data, action):
     c5 = vol_ratio >= VOLUME_CONFIRM_RATIO
 
     if action == "OPEN_LONG":
-        # Price pulling back to EMA from above: allow up to 2% below, 0.5% above
-        near_ema = pct_from_ema is not None and -EMA_BAND_PCT <= pct_from_ema <= EMA_BAND_PCT / 4
+        # Price still at/above EMA — limit at EMA rests below market as a maker order.
+        # Prices below EMA are excluded: a buy limit at EMA would cross (price < EMA → taker).
+        near_ema = pct_from_ema is not None and 0 <= pct_from_ema <= EMA_BAND_PCT
         c0 = (rsi_4h_v > 50) and (slope == "up")
         c2 = rsi_data.get('min_recent', 50.0) < RSI_LONG_THRESHOLD
         c3 = near_ema
@@ -944,8 +964,9 @@ def _check_pullback_entry(symbol, all_data, action):
             f"C5(vol={vol_ratio:.2f}≥{VOLUME_CONFIRM_RATIO})={'✓' if c5 else '✗'}"
         )
     elif action == "OPEN_SHORT":
-        # Price bouncing up to EMA from below: allow 0.5% below, up to 2% above
-        near_ema = pct_from_ema is not None and -EMA_BAND_PCT / 4 <= pct_from_ema <= EMA_BAND_PCT
+        # Price still at/below EMA — limit at EMA rests above market as a maker order.
+        # Prices above EMA are excluded: a sell limit at EMA would cross (price > EMA → taker).
+        near_ema = pct_from_ema is not None and -EMA_BAND_PCT <= pct_from_ema <= 0
         c0 = (rsi_4h_v < 50) and (slope == "down")
         c2 = rsi_data.get('max_recent', 50.0) > RSI_SHORT_THRESHOLD
         c3 = near_ema
