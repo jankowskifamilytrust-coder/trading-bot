@@ -10,54 +10,48 @@ from loguru import logger
 
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
-mainnet_info = Info(constants.MAINNET_API_URL, skip_ws=True)
-testnet_info = Info(constants.TESTNET_API_URL, skip_ws=True)
-exchange = Exchange(wallet, constants.TESTNET_API_URL)
 
-_TESTNET_COINS = None
-_TESTNET_COINS_TS = 0.0
-_TESTNET_COINS_TTL = 24 * 3600
+# MAINNET-only, dual-dex: the standard perp dex ("") and the xyz HIP-3 builder
+# dex. Building Info/Exchange with perp_dexs=["", "xyz"] lets a single object
+# serve candles for both dexes and auto-route order()/market_close()/
+# update_leverage()/l2_snapshot() to the right dex off the "xyz:" name prefix.
+# Note: all_mids() and user_state() are per-dex and take a dex= argument.
+mainnet_info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", "xyz"])
+exchange = Exchange(wallet, constants.MAINNET_API_URL, perp_dexs=["", "xyz"])
+
+DEXES = ["", "xyz"]
 
 
-def get_testnet_coins():
-    global _TESTNET_COINS, _TESTNET_COINS_TS
-    if _TESTNET_COINS is None or time.time() - _TESTNET_COINS_TS > _TESTNET_COINS_TTL:
+def dex_of(sym):
+    """Dex a symbol trades on, derived from its name prefix."""
+    return "xyz" if sym.startswith("xyz:") else ""
+
+
+def get_all_mids():
+    """Merged mid-price map across both dexes. xyz keys keep the 'xyz:' prefix,
+    so there is no key collision with standard symbols."""
+    mids = {}
+    for d in DEXES:
         try:
-            meta = testnet_info.meta()
-            _TESTNET_COINS = {a['name'] for a in meta['universe']}
-            _TESTNET_COINS_TS = time.time()
-            logger.info(f"Testnet supports {len(_TESTNET_COINS)} tradeable perps")
+            mids.update(mainnet_info.all_mids(dex=d))
         except Exception as e:
-            logger.error(f"Could not fetch testnet coins: {e}")
-            if _TESTNET_COINS is None:
-                _TESTNET_COINS = set()
-    return _TESTNET_COINS
+            logger.warning(f"all_mids dex={d!r} failed: {e}")
+    return mids
 
 
-def get_testnet_price_map():
-    price_map = {}
+def meta_and_ctxs(dex=""):
+    """Return [meta, asset_ctxs] for a dex. Standard uses the SDK helper; xyz
+    uses a raw /info post (the SDK helper is standard-dex only)."""
+    if dex == "":
+        return mainnet_info.meta_and_asset_ctxs()
+    return mainnet_info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+
+
+def get_book(symbol):
+    """Return (best_bid, best_ask, tick, decimals) from the mainnet L2 book.
+    l2_snapshot resolves xyz: symbols via the dual-dex name map."""
     try:
-        ctxs_data = testnet_info.meta_and_asset_ctxs()
-        universe = ctxs_data[0]['universe']
-        ctxs = ctxs_data[1]
-        for i, a in enumerate(universe):
-            if i < len(ctxs):
-                ctx = ctxs[i]
-                mid = ctx.get('midPx') or ctx.get('markPx')
-                oracle = ctx.get('oraclePx')
-                if mid and oracle:
-                    mid = float(mid); oracle = float(oracle)
-                    gap_pct = abs(mid - oracle) / oracle * 100 if oracle else 0
-                    price_map[a['name']] = {"price": mid, "oracle": oracle, "gap_pct": gap_pct}
-    except Exception as e:
-        logger.warning(f"Could not fetch testnet price map: {e}")
-    return price_map
-
-
-def get_testnet_book(symbol):
-    """Return (best_bid, best_ask, tick, decimals) from the testnet L2 book."""
-    try:
-        l2 = testnet_info.l2_snapshot(symbol)
+        l2 = mainnet_info.l2_snapshot(symbol)
         bids = l2['levels'][0]
         asks = l2['levels'][1]
 
@@ -120,20 +114,24 @@ def cancel_order(symbol, oid):
 _last_positions: dict = {}
 
 def get_open_positions():
+    """All open positions across both dexes, flat dict keyed by symbol (xyz: keys
+    carry the prefix). Each entry tagged with its 'dex' for per-dex grouping."""
     global _last_positions
     positions = {}
     try:
-        state = testnet_info.user_state(wallet.address)
-        for p in state.get('assetPositions', []):
-            pos = p.get('position', {})
-            coin = pos.get('coin')
-            size = float(pos.get('szi', 0))
-            entry = float(pos.get('entryPx', 0))
-            if size != 0:
-                positions[coin] = {
-                    "size": size, "entry": entry,
-                    "side": "LONG" if size > 0 else "SHORT"
-                }
+        for d in DEXES:
+            state = mainnet_info.user_state(wallet.address, dex=d)
+            for p in state.get('assetPositions', []):
+                pos = p.get('position', {})
+                coin = pos.get('coin')
+                size = float(pos.get('szi', 0))
+                entry = float(pos.get('entryPx', 0))
+                if size != 0:
+                    positions[coin] = {
+                        "size": size, "entry": entry,
+                        "side": "LONG" if size > 0 else "SHORT",
+                        "dex": d,
+                    }
         _last_positions = positions
         return positions
     except Exception as e:
@@ -141,12 +139,18 @@ def get_open_positions():
         return _last_positions
 
 
-def get_equity():
+def get_equity(dex=""):
+    """Account value for a single dex (HIP-3 dexes have isolated clearinghouses)."""
     try:
-        user_state = testnet_info.user_state(wallet.address)
+        user_state = mainnet_info.user_state(wallet.address, dex=dex)
         return float(user_state['marginSummary']['accountValue'])
     except Exception as e:
-        logger.error(f"Equity read error: {e}")
+        logger.error(f"Equity read error (dex={dex!r}): {e}")
         return 0.0
+
+
+def get_equity_by_dex():
+    """Per-dex equity map, e.g. {'': 1234.0, 'xyz': 56.0}."""
+    return {d: get_equity(d) for d in DEXES}
 
 

@@ -4,14 +4,15 @@ import math
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from loguru import logger
 
 from config import (
-    TOP_N, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
-    SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT,
-    RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MIN_NOTIONAL_USD, STOP_ATR_MULT,
+    TOP_N, STABLECOINS, MAX_POSITIONS, MAX_POSITIONS_PER_DEX, LEVERAGE, INTERVAL_MINUTES,
+    SLIPPAGE, SETTLE_SECONDS,
+    RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_PORTFOLIO_RISK_PCT_PER_DEX,
+    MIN_NOTIONAL_USD, STOP_ATR_MULT,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_PCT,
     TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG,
     VOLUME_RANK_LOG, VOLUME_RANK_TTL_HOURS, START_EQUITY_LOG,
@@ -19,10 +20,11 @@ from config import (
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_PERIOD, EMA_BAND_PCT,
-    FUNDING_LONG_MAX, FUNDING_SHORT_MIN, ADX_DECAY_EXIT,
+    FUNDING_LONG_MAX, FUNDING_SHORT_MIN, FUNDING_EXIT_THRESHOLD, ADX_DECAY_EXIT,
     VOLUME_CONFIRM_RATIO, STRUCT_STOP_BUFFER,
 )
 from notify import send_telegram
+from ai_advisor import log_advisor_verdict
 from signals import (
     compute_daily_vol, compute_atr,
     compute_funding, compute_supertrend, compute_adx, compute_rsi, compute_ema,
@@ -30,8 +32,9 @@ from signals import (
 )
 from exchange import (
     mainnet_info, exchange as hl_exchange,
-    get_testnet_coins, get_testnet_price_map, get_testnet_book,
-    place_alo_limit, cancel_order, get_open_positions, get_equity,
+    DEXES, dex_of, get_all_mids, meta_and_ctxs, get_book,
+    place_alo_limit, cancel_order, get_open_positions,
+    get_equity_by_dex,
 )
 
 load_dotenv()
@@ -65,41 +68,52 @@ def init_files():
             logger.info(f"Created {filepath}")
 
 def sleep_until_next_hour():
-    now = datetime.now()
-    next_run = (INTERVAL_MINUTES - (now.minute % INTERVAL_MINUTES)) * 60 - now.second
+    # Align to the next INTERVAL_MINUTES boundary in UTC so 4h cycles land on the
+    # exchange's 4h candle boundaries (00/04/08/12/16/20 UTC). A small buffer past
+    # the boundary ensures the just-closed bar is available before we fetch.
+    BUFFER_SEC = 15
+    now = datetime.now(timezone.utc)
+    secs_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
+    interval_sec = INTERVAL_MINUTES * 60
+    next_boundary = ((secs_since_midnight // interval_sec) + 1) * interval_sec
+    next_run = next_boundary - secs_since_midnight + BUFFER_SEC
     next_time = datetime.fromtimestamp(time.time() + next_run).strftime('%H:%M:%S')
-    logger.info(f"Sleeping {next_run//60}m {next_run%60}s — next cycle at {next_time}")
+    logger.info(f"Sleeping {next_run//60}m {next_run%60}s — next cycle at {next_time} (4h UTC-aligned)")
     time.sleep(next_run)
 
 # ─── Dynamic Symbol Selection ─────────────────────────────────────────────────
 
 def build_volume_ranking():
     """
-    Fetch 30-day daily candles for all testnet-tradeable non-stablecoin symbols
-    and compute average daily dollar volume (v × close). Pre-filters to top-50
-    by 24h vol to bound the number of API calls. Results cached in VOLUME_RANK_LOG.
-    Returns [[symbol, avg_vol_usd], ...] sorted descending.
+    Fetch 30-day daily candles for non-stablecoin symbols across BOTH the standard
+    perp dex and the xyz HIP-3 dex, and compute average daily dollar volume
+    (v × close). Pre-filters by 24h vol to bound API calls. Results cached in
+    VOLUME_RANK_LOG. Returns [[symbol, avg_vol_usd], ...] sorted descending.
+    xyz symbols carry the 'xyz:' prefix in their names.
     """
-    logger.info("Building 30-day avg volume ranking (runs once per day)...")
+    logger.info("Building 30-day avg volume ranking across std + xyz dexes (runs once per day)...")
     end_ms   = int(time.time() * 1000)
     start_ms = end_ms - 30 * 24 * 60 * 60 * 1000
 
-    meta_ctxs     = mainnet_info.meta_and_asset_ctxs()
-    universe      = meta_ctxs[0]['universe']
-    ctxs          = meta_ctxs[1]
-    testnet_coins = get_testnet_coins()
-
-    # Candidate pool: testnet-tradeable non-stablecoins, pre-sorted by 24h vol
+    # Candidate pool across both dexes, pre-sorted by 24h vol. Standard dex is
+    # large so cap to its top-50; xyz dex is small (~91) so include all of it.
     candidates = []
-    for i, asset in enumerate(universe):
-        name = asset['name']
-        if name.upper() in STABLECOINS or i >= len(ctxs):
+    for dex, cap in (("", 50), ("xyz", None)):
+        try:
+            meta_ctxs = meta_and_ctxs(dex)
+            universe, ctxs = meta_ctxs[0]['universe'], meta_ctxs[1]
+        except Exception as e:
+            logger.warning(f"Volume rank: meta fetch for dex={dex!r} failed — {e}")
             continue
-        if testnet_coins and name not in testnet_coins:
-            continue
-        candidates.append((name, float(ctxs[i].get('dayNtlVlm', 0))))
+        dex_cands = []
+        for i, asset in enumerate(universe):
+            name = asset['name']
+            if name.upper() in STABLECOINS or i >= len(ctxs):
+                continue
+            dex_cands.append((name, float(ctxs[i].get('dayNtlVlm', 0))))
+        dex_cands.sort(key=lambda x: x[1], reverse=True)
+        candidates += dex_cands[:cap] if cap else dex_cands
     candidates.sort(key=lambda x: x[1], reverse=True)
-    candidates = candidates[:50]
 
     def fetch_30d(sym):
         try:
@@ -147,7 +161,7 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
                 top.append(sym)
                 logger.info(f"  Keeping {sym} (open position)")
 
-        logger.info(f"Top {top_n} testnet perps by 30-day avg $ volume:")
+        logger.info(f"Top {top_n} mainnet perps (std + xyz) by 30-day avg $ volume:")
         for rank, (sym, vol) in enumerate(ranking[:top_n], 1):
             logger.info(f"  #{rank} {sym}: ${vol:,.0f}/day")
 
@@ -161,46 +175,19 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
 def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=None):
     for attempt in range(1, max_retries + 1):
         try:
-            _mids = mids if mids is not None else mainnet_info.all_mids()
+            _mids = mids if mids is not None else get_all_mids()
             if symbol not in _mids:
                 logger.warning(f"{symbol} not found on Hyperliquid")
                 return None
 
             price = float(_mids[symbol])
-            end_time = int(time.time() * 1000)
-            start_time = end_time - (48 * 60 * 60 * 1000)
-            candles = mainnet_info.candles_snapshot(symbol, "1h", start_time, end_time)
 
-            # Drop any partially-formed bar — all signals must be computed on the
-            # most recent *fully closed* 60-min bar only.
-            interval_ms = INTERVAL_MINUTES * 60 * 1000
-            if candles:
-                try:
-                    age_ms = end_time - int(candles[-1]['t'])
-                    if age_ms < interval_ms:
-                        candles = candles[:-1]
-                        logger.debug(
-                            f"{symbol}: forming bar dropped ({age_ms//60000}min old); "
-                            f"closed bar t={candles[-1]['t'] if candles else 'n/a'}"
-                        )
-                    else:
-                        logger.debug(
-                            f"{symbol}: last bar confirmed closed (age {age_ms//60000}min), t={candles[-1]['t']}"
-                        )
-                except (KeyError, TypeError):
-                    pass  # no 't' field — can't verify, proceed
-            if not candles:
-                logger.warning(f"{symbol}: no closed bars after dropping forming bar — skipping")
-                return None
-
-            universe = asset_ctxs[0]['universe'] if asset_ctxs else None
-            if universe is None:
-                try:
-                    universe = mainnet_info.meta()['universe']
-                except Exception:
-                    universe = []
-            asset_info = next((a for a in universe if a['name'] == symbol), None)
-            sz_decimals = int(asset_info['szDecimals']) if asset_info else 3
+            # szDecimals via the dual-dex SDK map so xyz: symbols resolve correctly
+            # (asset_ctxs passed in is standard-dex only and misses xyz names).
+            try:
+                sz_decimals = mainnet_info.asset_to_sz_decimals[mainnet_info.name_to_asset(symbol)]
+            except Exception:
+                sz_decimals = 3
 
             # Daily candles — shared by Supertrend, ADX, and ATR sizing
             daily_candles = None
@@ -216,52 +203,58 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
                         pass
                 supertrend = compute_supertrend(daily_candles)
                 adx = compute_adx(daily_candles)
+                # C0: daily EMA slope (one timeframe up from the 4h entry trigger)
+                d_ema_now  = compute_ema(daily_candles, period=EMA_PERIOD)
+                d_ema_prev = compute_ema(daily_candles[:-3], period=EMA_PERIOD) \
+                             if daily_candles and len(daily_candles) > EMA_PERIOD + 3 else None
+                daily_slope = ("up" if d_ema_now > d_ema_prev else "down") \
+                              if (d_ema_now and d_ema_prev) else "unknown"
             except Exception as e:
                 logger.warning(f"{symbol}: daily candle fetch failed — Supertrend/ADX neutral: {e}")
                 supertrend = {"direction": "neutral", "value": 0.0, "changed": False}
                 adx = {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
+                daily_slope = "unknown"
 
-            # 4h candles — intermediate timeframe filter
+            # 4h candles — entry-trigger timeframe (C2–C5), matches backtest
+            candles_4h = []
             try:
                 h4_end = int(time.time() * 1000)
                 h4_start = h4_end - (30 * 24 * 60 * 60 * 1000)
                 candles_4h = mainnet_info.candles_snapshot(symbol, "4h", h4_start, h4_end)
-                # Drop forming 4h bar
+                # Drop forming 4h bar — compute only on the most recent *closed* 4h bar
                 if candles_4h:
                     try:
                         if h4_end - int(candles_4h[-1]['t']) < 4 * 60 * 60 * 1000:
                             candles_4h = candles_4h[:-1]
                     except (KeyError, TypeError):
                         pass
-                rsi_4h = compute_rsi(candles_4h, period=RSI_PERIOD, lookback=3)
-                ema_4h_now  = compute_ema(candles_4h, period=EMA_PERIOD)
-                ema_4h_prev = compute_ema(candles_4h[:-3], period=EMA_PERIOD) \
-                              if len(candles_4h) > EMA_PERIOD + 3 else None
-                if ema_4h_now and ema_4h_prev:
-                    ema_4h_slope = "up" if ema_4h_now > ema_4h_prev else "down"
-                else:
-                    ema_4h_slope = "unknown"
             except Exception as e:
                 logger.warning(f"{symbol}: 4h candle fetch failed: {e}")
-                rsi_4h = {"rsi": 50.0, "prev_rsi": 50.0, "min_recent": 50.0, "max_recent": 50.0}
-                ema_4h_slope = "unknown"
+                candles_4h = []
+
+            if not candles_4h or len(candles_4h) < EMA_PERIOD + RSI_LOOKBACK + 2:
+                logger.warning(f"{symbol}: insufficient closed 4h bars ({len(candles_4h)}) — skipping")
+                return None
+
+            rsi_entry       = compute_rsi(candles_4h, period=RSI_PERIOD, lookback=RSI_LOOKBACK)
+            ema_entry       = compute_ema(candles_4h, period=EMA_PERIOD)
+            vol_ratio_entry = compute_volume_ratio(candles_4h, lookback=10)
 
             return {
                 "symbol": symbol, "price": price,
                 "tn_price": price,
                 "sz_decimals": sz_decimals,
-                "daily_vol": compute_daily_vol(candles),
+                "daily_vol": compute_daily_vol(candles_4h),
                 "atr": compute_atr(daily_candles) if daily_candles else None,
                 "funding_data": compute_funding(symbol, asset_ctxs),
                 "supertrend": supertrend,
                 "adx": adx,
-                "rsi_60": compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK),
-                "ema20_60": compute_ema(candles, period=EMA_PERIOD),
-                "vol_ratio_60": compute_volume_ratio(candles, lookback=10),
+                "daily_slope": daily_slope,
+                "rsi_entry": rsi_entry,
+                "ema_entry": ema_entry,
+                "vol_ratio_entry": vol_ratio_entry,
                 "struct_stops": compute_struct_stops(daily_candles, lookback=20) if daily_candles
-                               else compute_struct_stops(candles, lookback=48),
-                "rsi_4h": rsi_4h,
-                "ema_4h_slope": ema_4h_slope,
+                               else compute_struct_stops(candles_4h, lookback=20),
             }
         except Exception as e:
             if attempt < max_retries:
@@ -274,20 +267,26 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
 def get_all_market_data(symbols, open_position_syms=None):
     open_position_syms = open_position_syms or set()
     logger.info("Fetching market data + orderflow for selected symbols (parallel)...")
-    asset_ctxs = None
-    try:
-        asset_ctxs = mainnet_info.meta_and_asset_ctxs()
-    except Exception as e:
-        logger.warning(f"Could not pre-fetch asset contexts — funding data unavailable this cycle: {e}")
+    # Per-dex asset contexts (funding) — xyz funding lives in the xyz dex ctxs.
+    ctxs_by_dex = {}
+    for d in DEXES:
+        try:
+            ctxs_by_dex[d] = meta_and_ctxs(d)
+        except Exception as e:
+            logger.warning(f"Could not pre-fetch asset contexts dex={d!r} — funding unavailable: {e}")
+            ctxs_by_dex[d] = None
     mids = None
     try:
-        mids = mainnet_info.all_mids()
+        mids = get_all_mids()
     except Exception as e:
         logger.warning(f"Could not pre-fetch mid prices — will fetch per-symbol: {e}")
     all_data = {}
     failed = []
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(get_symbol_data, sym, 3, 5, asset_ctxs, mids): sym for sym in symbols}
+        futures = {
+            executor.submit(get_symbol_data, sym, 3, 5, ctxs_by_dex.get(dex_of(sym)), mids): sym
+            for sym in symbols
+        }
         for future in as_completed(futures):
             sym = futures[future]
             try:
@@ -300,42 +299,24 @@ def get_all_market_data(symbols, open_position_syms=None):
                 logger.error(f"{sym} fetch error: {e}")
                 failed.append(sym)
 
-    tn_prices = get_testnet_price_map()
-    wide_gap = []
-    for sym in list(all_data.keys()):
-        info_px = tn_prices.get(sym)
-        if info_px and info_px['gap_pct'] > MAX_ORACLE_GAP_PCT:
-            if sym in open_position_syms:
-                all_data[sym]['tn_price'] = info_px['price']
-                logger.info(f"  {sym} has wide oracle gap ({info_px['gap_pct']:.1f}%) but is held — keeping for management")
-                continue
-            wide_gap.append(f"{sym} ({info_px['gap_pct']:.1f}%)")
-            del all_data[sym]
-            continue
-        if not info_px:
-            logger.warning(f"  {sym}: testnet price unavailable — using mainnet price, oracle gap check skipped")
-        all_data[sym]['tn_price'] = info_px['price'] if info_px else all_data[sym]['price']
-
-    if wide_gap:
-        logger.info(f"Skipping wide oracle-gap coins (won't fill cleanly on testnet): {', '.join(wide_gap)}")
-
+    # No oracle-gap filter on mainnet: the mid IS the real market (mid≈oracle).
+    # tn_price is already set to the mainnet mid in get_symbol_data.
     for sym, data in all_data.items():
         vol_str = f"{data['daily_vol']*100:.1f}%" if data['daily_vol'] else "n/a"
         st = data['supertrend']
         adx = data['adx']
         st_tag  = f"ST={st['direction'].upper()}" + (" [FLIP]" if st['changed'] else "")
         adx_tag = f"ADX={adx['adx']:.1f}" + (" ✓" if adx['trending'] else " ✗chop")
-        rsi_d = data.get('rsi_60', {})
-        ema_v = data.get('ema20_60')
-        rsi_tag = f"RSI={rsi_d.get('rsi', 0):.1f}(min{rsi_d.get('min_recent',0):.1f}/max{rsi_d.get('max_recent',0):.1f})"
-        ema_tag = f"EMA20=${ema_v:.4f}" if ema_v else "EMA20=n/a"
-        rsi4_val = data.get('rsi_4h', {}).get('rsi', 0)
-        slope_tag = data.get('ema_4h_slope', '?')
-        vol_r = data.get('vol_ratio_60', 1.0)
+        rsi_d = data.get('rsi_entry', {})
+        ema_v = data.get('ema_entry')
+        rsi_tag = f"4hRSI={rsi_d.get('rsi', 0):.1f}(min{rsi_d.get('min_recent',0):.1f}/max{rsi_d.get('max_recent',0):.1f})"
+        ema_tag = f"4hEMA20=${ema_v:.4f}" if ema_v else "4hEMA20=n/a"
+        slope_tag = data.get('daily_slope', '?')
+        vol_r = data.get('vol_ratio_entry', 1.0)
         logger.info(
-            f"  {sym}: testnet ${data['tn_price']:.4f} | DailyVol={vol_str} | "
+            f"  {sym}: mid ${data['tn_price']:.4f} | DailyVol={vol_str} | "
             f"Funding={data['funding_data']['funding']}% | {st_tag} | {adx_tag} | "
-            f"{rsi_tag} | {ema_tag} | 4hRSI={rsi4_val:.1f} slope={slope_tag} | VolRatio={vol_r:.2f}"
+            f"{rsi_tag} | {ema_tag} | dailySlope={slope_tag} | VolRatio={vol_r:.2f}"
         )
 
     if failed:
@@ -568,13 +549,13 @@ def check_pending_loc(positions, all_data, equity):
 
 def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     """
-    Limit-on-close entry. Signals are computed on the just-closed bar; this
-    places one post-only limit at the 60-min EMA (the pullback level) and
+    Limit-on-close entry. Signals are computed on the just-closed 4h bar; this
+    places one post-only limit at the 4h EMA (the pullback level) and
     returns immediately. The order rests on the exchange for up to one bar.
     check_pending_loc() resolves it next cycle: finalizes if filled, cancels if not.
     """
     data        = all_data[symbol]
-    ema_val     = data.get('ema20_60')
+    ema_val     = data.get('ema_entry')
     price       = data.get('tn_price') or data.get('price', 0)
     sz_decimals = data.get('sz_decimals', 3)
     direction   = "LONG" if is_long else "SHORT"
@@ -595,7 +576,7 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     except Exception as e:
         logger.warning(f"Could not set leverage for {symbol}: {e}")
 
-    best_bid, best_ask, tick, decimals = get_testnet_book(symbol)
+    best_bid, best_ask, tick, decimals = get_book(symbol)
     if best_bid is None:
         logger.error(f"{symbol}: no book — cannot place LOC order")
         return False
@@ -724,6 +705,27 @@ def check_stops(positions, all_data, equity):
             peaks[sym] = {"peak": entry, "struct_stop": None, "atr": None}
             peaks_changed = True
         peak_data = peaks[sym]
+
+        # ── 0. Funding exit — close if funding turns adverse while held ──────
+        funding = data.get('funding_data', {}).get('funding', 0.0)
+        funding_against = (side == "LONG"  and funding >  FUNDING_EXIT_THRESHOLD) or \
+                          (side == "SHORT" and funding < -FUNDING_EXIT_THRESHOLD)
+        if funding_against:
+            logger.warning(
+                f"💸 FUNDING EXIT {sym} {side}: funding {funding:.4f}% adverse "
+                f"(threshold ±{FUNDING_EXIT_THRESHOLD}%) — closing"
+            )
+            send_telegram(
+                f"💸 <b>FUNDING EXIT {sym} {side}</b>\n"
+                f"Funding {funding:.4f}% turned adverse (±{FUNDING_EXIT_THRESHOLD}%) — market close"
+            )
+            if close_position_market(sym, all_data, equity,
+                                     f"Funding adverse ({funding:.4f}%)"):
+                peaks.pop(sym, None)
+                peaks_changed = True
+                closed_any = True
+                time.sleep(1)
+            continue
 
         # ── 1. Supertrend exit — close whenever ST is against position ───────
         st = data.get('supertrend', {})
@@ -871,12 +873,12 @@ def select_entry(all_data, positions):
       C1b  Daily ADX > ADX_THRESHOLD + DI direction confirmation
       Funding gate — skip crowded-side entries
 
-    Conditions delegated to _check_pullback_entry:
-      C0   4h RSI and EMA slope in trade direction (intermediate timeframe filter)
-      C2   60-min RSI dipped below RSI_LONG_THRESHOLD / spiked above RSI_SHORT_THRESHOLD
-      C3   Price within ±EMA_BAND_PCT of 20-EMA on 60-min
-      C4   RSI hook back in trend direction
-      C5   Current bar volume ≥ VOLUME_CONFIRM_RATIO × 10-bar average
+    Conditions delegated to _check_pullback_entry (all on 4h bars):
+      C0   Daily EMA slope in trade direction (higher-timeframe filter)
+      C2   4h RSI dipped below RSI_LONG_THRESHOLD / spiked above RSI_SHORT_THRESHOLD
+      C3   Price within ±EMA_BAND_PCT of 20-EMA on 4h
+      C4   4h RSI hook back in trend direction
+      C5   Current 4h bar volume ≥ VOLUME_CONFIRM_RATIO × 10-bar average
     """
     candidates = []
     for symbol, data in all_data.items():
@@ -915,8 +917,8 @@ def select_entry(all_data, positions):
 
         passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
         if not passed:
-            if data.get('ema_4h_slope') == 'unknown':
-                logger.info(f"  {symbol} {action}: C0 blocked — insufficient 4h history for slope")
+            if data.get('daily_slope') == 'unknown':
+                logger.info(f"  {symbol} {action}: C0 blocked — insufficient daily history for slope")
             else:
                 logger.debug(f"  {symbol} {action}: pullback not ready — {pb_reason}")
             continue
@@ -942,25 +944,24 @@ def select_entry(all_data, positions):
 def _check_pullback_entry(symbol, all_data, action):
     """
     Validates pullback conditions C0–C5 for OPEN_LONG / OPEN_SHORT.
-    C0: 4h RSI > 50 and 4h EMA slope is in trade direction (intermediate filter).
-    C2: RSI dipped below RSI_LONG_THRESHOLD (long) or spiked above RSI_SHORT_THRESHOLD (short)
+    All entry-trigger conditions (C2–C5) are computed on 4h bars (matches backtest).
+    C0: Daily EMA slope is in trade direction (higher-timeframe filter).
+    C2: 4h RSI dipped below RSI_LONG_THRESHOLD (long) or spiked above RSI_SHORT_THRESHOLD (short)
         within the last RSI_LOOKBACK bars.
-    C3: Price is within EMA_BAND_PCT of the 20-EMA on 60-min.
-    C4: RSI is now hooking back in the direction of the trade.
-    C5: Current bar volume ≥ VOLUME_CONFIRM_RATIO × 10-bar average (volume confirmation).
+    C3: Price is within EMA_BAND_PCT of the 20-EMA on 4h.
+    C4: 4h RSI is now hooking back in the direction of the trade.
+    C5: Current 4h bar volume ≥ VOLUME_CONFIRM_RATIO × 10-bar average (volume confirmation).
     Returns (passed: bool, reason: str).
     """
     data      = all_data[symbol]
-    rsi_data  = data.get('rsi_60', {})
-    ema_val   = data.get('ema20_60')
+    rsi_data  = data.get('rsi_entry', {})
+    ema_val   = data.get('ema_entry')
     price     = data.get('tn_price') or data.get('price', 0)
-    rsi_4h    = data.get('rsi_4h', {})
-    slope     = data.get('ema_4h_slope', 'unknown')
-    vol_ratio = data.get('vol_ratio_60', 1.0)
+    slope     = data.get('daily_slope', 'unknown')
+    vol_ratio = data.get('vol_ratio_entry', 1.0)
 
     rsi      = rsi_data.get('rsi', 50.0)
     prev_rsi = rsi_data.get('prev_rsi', 50.0)
-    rsi_4h_v = rsi_4h.get('rsi', 50.0)
 
     pct_from_ema = None
     pct_str = "n/a"
@@ -975,13 +976,13 @@ def _check_pullback_entry(symbol, all_data, action):
         # Price still at/above EMA — limit at EMA rests below market as a maker order.
         # Prices below EMA are excluded: a buy limit at EMA would cross (price < EMA → taker).
         near_ema = pct_from_ema is not None and 0 <= pct_from_ema <= EMA_BAND_PCT
-        c0 = (rsi_4h_v > 50) and (slope == "up")
+        c0 = slope == "up"
         c2 = rsi_data.get('min_recent', 50.0) < RSI_LONG_THRESHOLD
         c3 = near_ema
         c4 = rsi > prev_rsi
         passed = c0 and c2 and c3 and c4 and c5
         reason = (
-            f"C0(4hRSI={rsi_4h_v:.1f}>50,slope={slope})={'✓' if c0 else '✗'} "
+            f"C0(daily slope={slope})={'✓' if c0 else '✗'} "
             f"C2(dip<{RSI_LONG_THRESHOLD})={'✓' if c2 else '✗'}[min={rsi_data.get('min_recent',50):.1f}] "
             f"C3(near EMA {ema_str} {pct_str})={'✓' if c3 else '✗'} "
             f"C4(hook↑ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'} "
@@ -991,13 +992,13 @@ def _check_pullback_entry(symbol, all_data, action):
         # Price still at/below EMA — limit at EMA rests above market as a maker order.
         # Prices above EMA are excluded: a sell limit at EMA would cross (price > EMA → taker).
         near_ema = pct_from_ema is not None and -EMA_BAND_PCT <= pct_from_ema <= 0
-        c0 = (rsi_4h_v < 50) and (slope == "down")
+        c0 = slope == "down"
         c2 = rsi_data.get('max_recent', 50.0) > RSI_SHORT_THRESHOLD
         c3 = near_ema
         c4 = rsi < prev_rsi
         passed = c0 and c2 and c3 and c4 and c5
         reason = (
-            f"C0(4hRSI={rsi_4h_v:.1f}<50,slope={slope})={'✓' if c0 else '✗'} "
+            f"C0(daily slope={slope})={'✓' if c0 else '✗'} "
             f"C2(spike>{RSI_SHORT_THRESHOLD})={'✓' if c2 else '✗'}[max={rsi_data.get('max_recent',50):.1f}] "
             f"C3(near EMA {ema_str} {pct_str})={'✓' if c3 else '✗'} "
             f"C4(hook↓ {prev_rsi:.1f}→{rsi:.1f})={'✓' if c4 else '✗'} "
@@ -1155,28 +1156,28 @@ def run_bot():
             _lf.write(str(os.getpid()))
     atexit.register(lambda: os.path.exists(lockfile) and os.remove(lockfile))
 
+    caps_str = " ".join(f"{d or 'std'}={n}" for d, n in MAX_POSITIONS_PER_DEX.items())
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
-    logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 30-day avg daily dollar volume")
+    logger.info(f"Dynamic selection: TOP {TOP_N} mainnet perps (std + xyz) by 30-day avg daily dollar volume")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
     logger.info(f"Exits: ST against position | ADX decay <{ADX_DECAY_EXIT} | chandelier {STOP_ATR_MULT}×ATR + struct stop")
-    logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")
+    logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | per-dex portfolio caps | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")
     logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +{STOP_ATR_MULT}×ATR")
-    logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS} | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
-    logger.info(f"Data: MAINNET | Trading: TESTNET | Interval: {INTERVAL_MINUTES}min (clock-aligned)")
+    logger.info(f"Leverage: {LEVERAGE}x | Max positions per dex: {caps_str}")
+    logger.info(f"Trading: MAINNET (std + xyz dexes) | Interval: {INTERVAL_MINUTES}min ({INTERVAL_MINUTES//60}h, UTC-aligned)")
 
     init_files()
-    get_testnet_coins()
     if not load_json(START_EQUITY_LOG, None):
-        first_eq = get_equity()
+        first_eq = sum(get_equity_by_dex().values())
         if first_eq > 0:
             save_json(START_EQUITY_LOG, {"equity": first_eq, "recorded_at": datetime.now().isoformat()})
             logger.info(f"Start equity recorded: ${first_eq:.2f}")
     send_telegram(
         "🤖 <b>Trading Bot Started</b>\n"
-        f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max {MAX_POSITIONS}\n"
+        f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max/dex {caps_str}\n"
         f"Entries: rule-based (ST + ADX + pullback) | Post-only maker\n"
         f"Exits: ST against position | ADX decay | chandelier {STOP_ATR_MULT}×ATR\n"
-        "Data: MAINNET | Trading: TESTNET"
+        "Trading: MAINNET (std + xyz dexes)"
     )
 
     while True:
@@ -1186,56 +1187,71 @@ def run_bot():
             positions = get_open_positions()
             symbols   = get_top_symbols(TOP_N, extra_symbols=list(positions.keys()))
             all_data  = get_all_market_data(symbols, open_position_syms=set(positions.keys()))
-            equity = get_equity()
-            if equity <= 0:
-                equity = get_equity()   # one retry on transient API failure
+            equity_by_dex = get_equity_by_dex()
+            total_equity  = sum(equity_by_dex.values())
 
-            logger.info(f"Equity: ${equity:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
+            eq_str = " ".join(f"{d or 'std'}=${equity_by_dex.get(d, 0):.2f}" for d in DEXES)
+            logger.info(f"Equity by dex: {eq_str} | Open positions: {len(positions)}")
 
             # ── Step 0: Resolve pending LOC orders from last cycle ─────────────
             positions = get_open_positions()   # refresh — LOC may have filled during market data fetch
-            check_pending_loc(positions, all_data, equity)
+            check_pending_loc(positions, all_data, total_equity)
 
-            if equity > 0:
-                log_equity(equity, all_data, positions)
+            if total_equity > 0:
+                log_equity(total_equity, all_data, positions)
 
             # ── Step 1: Automatic stops ────────────────────────────────────────
             if positions:
-                stopped = check_stops(positions, all_data, equity)
+                stopped = check_stops(positions, all_data, total_equity)
                 if stopped:
                     time.sleep(SETTLE_SECONDS)
                     positions = get_open_positions()
-            equity = get_equity()  # always refresh before entry decision
+            equity_by_dex = get_equity_by_dex()  # refresh before entry decision
 
-            # ── Step 2: LOC entry (only if slot available, no pending order, heat OK)
+            # ── Step 2: Per-dex LOC entry — one entry per dex per cycle ─────────
+            # Each dex (standard "" / xyz HIP-3) is an isolated sub-portfolio with
+            # its own equity, position cap, and heat cap.
             pending_syms = set(_load_pending_loc().keys())
-            if len(pending_syms) + len(positions) < MAX_POSITIONS:
-                logger.info("Scanning for entry setups...")
+            peaks = _load_peaks()
+            for d in DEXES:
+                eq_d = equity_by_dex.get(d, 0.0)
+                if eq_d <= 0:
+                    continue  # no collateral on this dex — can't size/enter (positions still managed by stops)
+                pos_d  = {s: p for s, p in positions.items() if dex_of(s) == d}
+                pend_d = {s for s in pending_syms if dex_of(s) == d}
+                cap_d  = MAX_POSITIONS_PER_DEX.get(d, 0)
+                if len(pend_d) + len(pos_d) >= cap_d:
+                    continue
+                logger.info(f"[{d or 'std'}] scanning for entry (eq=${eq_d:.2f}, slots {len(pend_d)+len(pos_d)}/{cap_d})...")
                 # Treat pending symbols as taken slots so select_entry skips them
-                occupied = {**positions, **{sym: {"side": "PENDING"} for sym in pending_syms}}
-                entry_sym, is_long, pb_reason = select_entry(all_data, occupied)
-                if entry_sym:
-                    peaks = _load_peaks()
-                    # Open-position risk: full STOP_ATR_MULT×ATR even for BE-locked trades.
-                    # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
-                    # Prospective entry: +1 trade's worth so we can't step over the cap.
-                    open_risk = sum(
-                        abs(p['size']) * (peaks.get(sym, {}).get('atr') or all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
-                        for sym, p in positions.items()
-                    )
-                    open_risk += (len(pending_syms) + 1) * RISK_PER_TRADE_PCT * equity
-                    heat_pct = open_risk / equity if equity > 0 else 0
-                    logger.info(f"Portfolio heat: ${open_risk:.2f} = {heat_pct*100:.1f}% of equity")
-                    if heat_pct >= MAX_PORTFOLIO_RISK_PCT:
-                        logger.info(
-                            f"Heat {heat_pct*100:.1f}% ≥ {MAX_PORTFOLIO_RISK_PCT*100:.0f}% cap — skipping {entry_sym}"
-                        )
-                    else:
-                        place_loc_order(entry_sym, is_long, all_data, equity, pb_reason)
+                occupied = {**pos_d, **{s: {"side": "PENDING"} for s in pend_d}}
+                data_d   = {s: v for s, v in all_data.items() if dex_of(s) == d}
+                entry_sym, is_long, pb_reason = select_entry(data_d, occupied)
+                if not entry_sym:
+                    continue
+                try:
+                    log_advisor_verdict(entry_sym, is_long, pb_reason, all_data.get(entry_sym, {}))
+                except Exception as e:
+                    logger.warning(f"AI advisor hook failed (non-blocking): {e}")
+                # Open-position risk: full STOP_ATR_MULT×ATR even for BE-locked trades.
+                # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
+                # Prospective entry: +1 trade's worth so we can't step over the cap.
+                open_risk = sum(
+                    abs(p['size']) * (peaks.get(s, {}).get('atr') or all_data.get(s, {}).get('atr') or 0) * STOP_ATR_MULT
+                    for s, p in pos_d.items()
+                )
+                open_risk += (len(pend_d) + 1) * RISK_PER_TRADE_PCT * eq_d
+                heat_pct = open_risk / eq_d if eq_d > 0 else 0
+                cap_pct  = MAX_PORTFOLIO_RISK_PCT_PER_DEX.get(d, MAX_PORTFOLIO_RISK_PCT)
+                logger.info(f"[{d or 'std'}] heat: ${open_risk:.2f} = {heat_pct*100:.1f}% of dex equity (cap {cap_pct*100:.0f}%)")
+                if heat_pct >= cap_pct:
+                    logger.info(f"[{d or 'std'}] heat {heat_pct*100:.1f}% ≥ {cap_pct*100:.0f}% cap — skipping {entry_sym}")
+                    continue
+                place_loc_order(entry_sym, is_long, all_data, eq_d, pb_reason)
 
-            positions = get_open_positions()
-            equity    = get_equity()
-            print_summary(equity, positions, all_data)
+            positions    = get_open_positions()
+            total_equity = sum(get_equity_by_dex().values())
+            print_summary(total_equity, positions, all_data)
 
             sleep_until_next_hour()
 
