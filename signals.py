@@ -243,11 +243,12 @@ def compute_struct_stops(candles, lookback=5):
         return None, None
 
 
-def compute_funding(symbol, info):
+def compute_funding(symbol, asset_ctxs):
     try:
-        asset_contexts = info.meta_and_asset_ctxs()
-        meta = asset_contexts[0]['universe']
-        ctxs = asset_contexts[1]
+        if asset_ctxs is None:
+            return {"funding": 0, "day_volume": 0}
+        meta = asset_ctxs[0]['universe']
+        ctxs = asset_ctxs[1]
         symbol_idx = next((i for i, a in enumerate(meta) if a['name'] == symbol), None)
         if symbol_idx is None or symbol_idx >= len(ctxs):
             return {"funding": 0, "day_volume": 0}

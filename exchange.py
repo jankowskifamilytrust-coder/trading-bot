@@ -132,16 +132,10 @@ def get_open_positions():
 
 def get_equity():
     try:
-        spot_state = testnet_info.spot_user_state(wallet.address)
-        for b in spot_state.get('balances', []):
-            if b.get('coin') == 'USDC':
-                return float(b.get('total', 0))
-    except Exception as e:
-        logger.error(f"Equity read error: {e}")
-    try:
         user_state = testnet_info.user_state(wallet.address)
         return float(user_state['marginSummary']['accountValue'])
-    except Exception:
+    except Exception as e:
+        logger.error(f"Equity read error: {e}")
         return 0.0
 
 

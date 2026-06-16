@@ -44,8 +44,10 @@ def load_json(filepath, default):
         return default
 
 def save_json(filepath, data):
-    with open(filepath, "w") as f:
+    tmp = filepath + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, filepath)
 
 def init_files():
     os.makedirs("data", exist_ok=True)
@@ -151,7 +153,7 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
 
 # ─── Market Data ──────────────────────────────────────────────────────────────
 
-def get_symbol_data(symbol, max_retries=3, retry_delay=5):
+def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None):
     for attempt in range(1, max_retries + 1):
         try:
             mids = mainnet_info.all_mids()
@@ -195,7 +197,8 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
             asset_info = next((a for a in meta['universe'] if a['name'] == symbol), None)
             sz_decimals = int(asset_info['szDecimals']) if asset_info else 3
 
-            # Daily candles — shared by Supertrend and ADX (one fetch, two indicators)
+            # Daily candles — shared by Supertrend, ADX, and ATR sizing
+            daily_candles = None
             try:
                 d_end = int(time.time() * 1000)
                 d_start = d_end - (90 * 24 * 60 * 60 * 1000)
@@ -238,8 +241,8 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "candle_summary": candle_summary,
                 "sz_decimals": sz_decimals,
                 "daily_vol": compute_daily_vol(candles),
-                "atr": compute_atr(candles),
-                "funding_data": compute_funding(symbol, mainnet_info),
+                "atr": compute_atr(daily_candles) if daily_candles else compute_atr(candles),
+                "funding_data": compute_funding(symbol, asset_ctxs),
                 "supertrend": supertrend,
                 "adx": adx,
                 "rsi_60": compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK),
@@ -260,10 +263,15 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
 def get_all_market_data(symbols, open_position_syms=None):
     open_position_syms = open_position_syms or set()
     logger.info("Fetching market data + orderflow for selected symbols (parallel)...")
+    asset_ctxs = None
+    try:
+        asset_ctxs = mainnet_info.meta_and_asset_ctxs()
+    except Exception as e:
+        logger.warning(f"Could not pre-fetch asset contexts — funding data unavailable this cycle: {e}")
     all_data = {}
     failed = []
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(get_symbol_data, sym, 3, 5): sym for sym in symbols}
+        futures = {executor.submit(get_symbol_data, sym, 3, 5, asset_ctxs): sym for sym in symbols}
         for future in as_completed(futures):
             sym = futures[future]
             try:
@@ -445,13 +453,13 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
     # Compute structural stop from swing low/high over the RSI lookback window
     struct_stop = None
     if sym_data and fill_px:
-        atr_val = sym_data.get('atr')
+        struct_atr = sym_data.get('atr')
         sw_low, sw_high = sym_data.get('struct_stops', (None, None))
-        if atr_val:
+        if struct_atr:
             if is_buy and sw_low and sw_low < fill_px:
-                struct_stop = sw_low - STRUCT_STOP_BUFFER * atr_val
+                struct_stop = sw_low - STRUCT_STOP_BUFFER * struct_atr
             elif not is_buy and sw_high and sw_high > fill_px:
-                struct_stop = sw_high + STRUCT_STOP_BUFFER * atr_val
+                struct_stop = sw_high + STRUCT_STOP_BUFFER * struct_atr
     if fill_px:
         init_peak(symbol, fill_px, struct_stop=struct_stop)
     action_label = "BUY" if is_buy else "SELL"
@@ -476,6 +484,7 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
 def close_position_market(symbol, all_data, equity, reason, confluence=""):
     """Guaranteed-fill market close. Used for all automatic exits."""
     exec_price = all_data.get(symbol, {}).get('tn_price') or all_data.get(symbol, {}).get('price', 0)
+    pre_size = abs((get_open_positions().get(symbol) or {}).get('size', 0))
     try:
         if exec_price:
             result = hl_exchange.market_close(symbol, None, exec_price, SLIPPAGE)
@@ -492,7 +501,7 @@ def close_position_market(symbol, all_data, equity, reason, confluence=""):
         if filled or symbol not in get_open_positions():
             logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (market)")
             clear_peak(symbol)
-            log_trade("CLOSE", symbol, 0, fill_px, reason, equity,
+            log_trade("CLOSE", symbol, pre_size, fill_px, reason, equity,
                       confluence)
             send_telegram(f"🔴 <b>CLOSE</b> (market)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
             return True
@@ -1076,6 +1085,7 @@ def run_bot():
             logger.info(f"Equity: ${equity:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
 
             # ── Step 0: Resolve pending LOC orders from last cycle ─────────────
+            positions = get_open_positions()   # refresh — LOC may have filled during market data fetch
             check_pending_loc(positions, all_data, equity)
 
             log_equity(equity, all_data, positions)
