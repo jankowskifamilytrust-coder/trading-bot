@@ -22,9 +22,8 @@ MAKER_WAIT_SECONDS = 30
 
 RISK_PER_TRADE_PCT   = 0.01   # fraction of equity risked per stop-out
 MAX_PORTFOLIO_RISK_PCT = 0.03  # total open risk cap before new entries are blocked
-MAX_NOTIONAL_USD = 200
 MIN_NOTIONAL_USD = 20
-MAX_NOTIONAL_PCT = 0.25   # equity-relative ceiling (fails safe — under-risks)
+MAX_NOTIONAL_PCT = 0.10   # equity-relative ceiling — 10% of equity per trade
 MIN_NOTIONAL_PCT = 0.02   # equity-relative floor (skip rather than inflate)
 
 STOP_ATR_MULT = 3.0

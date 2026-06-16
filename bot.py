@@ -9,7 +9,7 @@ from loguru import logger
 from config import (
     TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
-    RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_NOTIONAL_USD, MIN_NOTIONAL_USD, STOP_ATR_MULT,
+    RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MIN_NOTIONAL_USD, STOP_ATR_MULT,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_PCT,
     TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG,
     VOLUME_RANK_LOG, VOLUME_RANK_TTL_HOURS,
@@ -333,7 +333,7 @@ def compute_notional(symbol, all_data, equity):
     ATR-based sizing: risk exactly RISK_PER_TRADE_PCT of equity per stop-out.
     Returns (None, None) to signal skip — callers must handle this.
 
-    Cap  : min(ATR-sized, equity×MAX_NOTIONAL_PCT, MAX_NOTIONAL_USD) — fails safe.
+    Cap  : equity×MAX_NOTIONAL_PCT (10%) — scales with account, no static ceiling.
     Floor: skip rather than inflate — preserves the 1% guarantee.
     """
     atr   = all_data[symbol].get('atr')
@@ -353,7 +353,7 @@ def compute_notional(symbol, all_data, equity):
         )
         return None, None
 
-    notional = min(notional, equity * MAX_NOTIONAL_PCT, MAX_NOTIONAL_USD)
+    notional = min(notional, equity * MAX_NOTIONAL_PCT)
 
     floor = max(equity * MIN_NOTIONAL_PCT, MIN_NOTIONAL_USD)
     if notional < floor:
@@ -1060,7 +1060,7 @@ def run_bot():
     logger.info(f"Pinned symbols: {', '.join(PINNED)}")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
     logger.info(f"Exits: ST against position | ADX decay <{ADX_DECAY_EXIT} | chandelier {STOP_ATR_MULT}×ATR + struct stop")
-    logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional ${MIN_NOTIONAL_USD}–${MAX_NOTIONAL_USD}")
+    logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")
     logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +1×ATR")
     logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS} | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
     logger.info(f"Data: MAINNET | Trading: TESTNET | Interval: {INTERVAL_MINUTES}min (clock-aligned)")
