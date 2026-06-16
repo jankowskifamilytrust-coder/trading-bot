@@ -532,8 +532,7 @@ def check_pending_loc(positions, all_data, equity):
         oid       = meta['oid']
         direction = "LONG" if meta['is_buy'] else "SHORT"
 
-        expected_side = "LONG" if meta['is_buy'] else "SHORT"
-        if symbol in positions and positions[symbol]['side'] == expected_side:
+        if symbol in positions and positions[symbol]['side'] == direction:
             logger.info(f"{symbol} LOC {direction} filled while sleeping — finalizing")
             sym_data = all_data.get(symbol)
             if sym_data is None:
@@ -554,9 +553,12 @@ def check_pending_loc(positions, all_data, equity):
             logger.info(f"{symbol} LOC {direction} unfilled at bar close — cancelling (oid {oid})")
             try:
                 cancel_order(symbol, oid)
+                to_remove.append(symbol)
             except Exception as e:
-                logger.warning(f"{symbol} LOC cancel failed: {e}")
+                logger.warning(f"{symbol} LOC cancel failed: {e} — keeping in pending for next cycle")
+                continue
             send_telegram(f"⌛ <b>{symbol} {direction} LOC expired</b>\nOrder at ${meta['limit_px']:.4f} cancelled (no fill)")
+            continue
         to_remove.append(symbol)
 
     for symbol in to_remove:
@@ -607,6 +609,9 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     else:
         snapped = ema_val
     limit_px = float(f"{snapped:.5g}") if snapped > 0 else round(snapped, decimals)
+    if limit_px <= 0:
+        logger.warning(f"{symbol}: EMA snapped to zero (ema=${ema_val} < tick=${tick}) — skipping")
+        return False
     # Defence-in-depth: C3 tightening makes crossing unreachable in normal flow,
     # but guard remains for any edge case that slips through.
     if is_long and limit_px > best_bid:
@@ -760,7 +765,7 @@ def check_stops(positions, all_data, equity):
                     f"📉 ADX DECLINING {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} "
                     f"— confirming next bar before exit"
                 )
-                continue
+                # fall through to chandelier — don't skip stop protection during confirmation bar
             logger.warning(
                 f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
             )
