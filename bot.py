@@ -738,7 +738,15 @@ def check_stops(positions, all_data, equity):
 
         # ── 2. ADX decay exit — requires 2 consecutive bars below threshold ──
         adx_val = data.get('adx', {}).get('adx', 0.0)
-        if adx_val < ADX_DECAY_EXIT:
+        if adx_val == 0.0:
+            # Sentinel value — compute_adx returned its failure default.
+            # Treat as missing data: skip (don't count, don't close) and reset any
+            # in-progress decay counter so stale bad data can't accumulate toward exit.
+            if peak_data.get('adx_decay_count', 0):
+                peak_data['adx_decay_count'] = 0
+                peaks_changed = True
+            logger.warning(f"Stop check: ADX=0 for {sym} (sentinel) — skipping decay check")
+        elif adx_val < ADX_DECAY_EXIT:
             decay_hits = peak_data.get('adx_decay_count', 0)
             if decay_hits < 1:
                 peak_data['adx_decay_count'] = 1
