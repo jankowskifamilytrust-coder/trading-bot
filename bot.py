@@ -1049,7 +1049,7 @@ def print_summary(equity, positions, all_data):
         if current_price and p['entry']:
             unrealized_pnl += _pos_pnl(p, current_price)
 
-    realized_pnl = (equity - start_equity) - unrealized_pnl
+    realized_pnl = (equity - start_equity) - unrealized_pnl  # assumes no deposits/withdrawals since start
     total_pnl = equity - start_equity
     total_pnl_pct = (total_pnl / start_equity * 100) if start_equity > 0 else 0
 
@@ -1147,7 +1147,7 @@ def run_bot():
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
     logger.info(f"Exits: ST against position | ADX decay <{ADX_DECAY_EXIT} | chandelier {STOP_ATR_MULT}×ATR + struct stop")
     logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")
-    logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +1×ATR")
+    logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +{STOP_ATR_MULT}×ATR")
     logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS} | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
     logger.info(f"Data: MAINNET | Trading: TESTNET | Interval: {INTERVAL_MINUTES}min (clock-aligned)")
 

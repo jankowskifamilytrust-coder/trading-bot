@@ -14,10 +14,9 @@ STABLECOINS = {
 MAX_POSITIONS = 3
 LEVERAGE = 2
 INTERVAL_MINUTES = 60
-SLIPPAGE = 0.05
+SLIPPAGE = 0.05          # max slippage for market stop-out orders — large intentionally for guaranteed fills
 SETTLE_SECONDS = 3
 MAX_ORACLE_GAP_PCT = 3.0
-MAKER_WAIT_SECONDS = 30
 
 RISK_PER_TRADE_PCT   = 0.01   # fraction of equity risked per stop-out
 MAX_PORTFOLIO_RISK_PCT = 0.03  # total open risk cap before new entries are blocked
