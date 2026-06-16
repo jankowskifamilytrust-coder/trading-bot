@@ -651,7 +651,7 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
             "limit_px":    limit_px,
             "notional_usd": notional_usd,
             "atr_val":     atr_val,
-            "confluence":  "7/7 LOC",
+            "confluence":  confluence,
             "reason":      f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
         }
         _save_pending_loc(pending)
