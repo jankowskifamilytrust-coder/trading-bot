@@ -16,13 +16,13 @@ from config import (
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_PERIOD, EMA_BAND_PCT,
-    FUNDING_LONG_MAX, FUNDING_SHORT_MIN, ADX_CVD_BOOST, ADX_DECAY_EXIT,
+    FUNDING_LONG_MAX, FUNDING_SHORT_MIN, ADX_DECAY_EXIT,
     VOLUME_CONFIRM_RATIO, MAX_HOLD_HOURS, STRUCT_STOP_BUFFER,
 )
 from notify import send_telegram
 from signals import (
-    compute_daily_vol, compute_atr, compute_cvd,
-    compute_oi, compute_supertrend, compute_adx, compute_rsi, compute_ema,
+    compute_daily_vol, compute_atr,
+    compute_funding, compute_supertrend, compute_adx, compute_rsi, compute_ema,
     compute_volume_ratio, compute_struct_stops,
 )
 from exchange import (
@@ -248,8 +248,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5):
                 "sz_decimals": sz_decimals,
                 "daily_vol": compute_daily_vol(candles),
                 "atr": compute_atr(candles),
-                "cvd": compute_cvd(candles),
-                "oi": compute_oi(symbol, candles, price, mainnet_info),
+                "funding_data": compute_funding(symbol, mainnet_info),
                 "supertrend": supertrend,
                 "adx": adx,
                 "rsi_60": compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK),
@@ -318,8 +317,7 @@ def get_all_market_data(symbols, open_position_syms=None):
         vol_r = data.get('vol_ratio_60', 1.0)
         logger.info(
             f"  {sym}: testnet ${data['tn_price']:.4f} | DailyVol={vol_str} | "
-            f"OI=${data['oi']['oi_usd']:,.0f} | CVD={data['cvd']['cvd_trend']} | "
-            f"Funding={data['oi']['funding']}% | {st_tag} | {adx_tag} | "
+            f"Funding={data['funding_data']['funding']}% | {st_tag} | {adx_tag} | "
             f"{rsi_tag} | {ema_tag} | 4hRSI={rsi4_val:.1f} slope={slope_tag} | VolRatio={vol_r:.2f}"
         )
 
@@ -351,7 +349,7 @@ def compute_notional(symbol, all_data, equity):
 # ─── Entry (post-only maker) ──────────────────────────────────────────────────
 
 def open_position(symbol, is_buy, all_data, equity,
-                  cvd_signal, oi_signal, confluence, reason):
+                  confluence, reason):
     """
     Post-only maker entry. Two attempts: passive (at touch), then aggressive
     (one tick inside, toward mid). If neither fills, the trade is skipped.
@@ -395,7 +393,7 @@ def open_position(symbol, is_buy, all_data, equity,
 
         if status == 'filled':
             return _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
-                                  cvd_signal, oi_signal, confluence, reason, equity,
+                                  confluence, reason, equity,
                                   sym_data=sym_data)
 
         if status == 'rejected':
@@ -411,7 +409,7 @@ def open_position(symbol, is_buy, all_data, equity,
         filled = wait_until(symbol, want_open=True, seconds=MAKER_WAIT_SECONDS)
         if filled:
             return _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
-                                  cvd_signal, oi_signal, confluence, reason, equity,
+                                  confluence, reason, equity,
                                   sym_data=sym_data)
         cancel_order(symbol, oid)
         logger.info(f"{symbol} {tag} maker order unfilled in {MAKER_WAIT_SECONDS}s")
@@ -421,7 +419,7 @@ def open_position(symbol, is_buy, all_data, equity,
     return False
 
 def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
-                   cvd_signal, oi_signal, confluence, reason, equity, sym_data=None):
+                   confluence, reason, equity, sym_data=None):
     pos = get_open_positions().get(symbol)
     fill_px = pos['entry'] if pos else 0
     fill_sz = abs(pos['size']) if pos else 0
@@ -442,7 +440,7 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
         init_peak(symbol, fill_px, struct_stop=struct_stop)
     action_label = "BUY" if is_buy else "SELL"
     log_trade(action_label, symbol, fill_sz, fill_px, reason, equity,
-              cvd_signal, oi_signal, confluence)
+              confluence)
     emoji = "🟢" if is_buy else "🟠"
     stop_dist = f"${STOP_ATR_MULT * atr_val:.4f}" if atr_val else "n/a"
     dollar_risk = equity * RISK_PER_TRADE_PCT if equity else 0
@@ -459,8 +457,7 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
 
 # ─── Exits ────────────────────────────────────────────────────────────────────
 
-def close_position_market(symbol, all_data, equity, reason,
-                          cvd_signal="", oi_signal="", confluence=""):
+def close_position_market(symbol, all_data, equity, reason, confluence=""):
     """Guaranteed-fill market close. Used for all automatic exits."""
     exec_price = all_data.get(symbol, {}).get('tn_price') or all_data.get(symbol, {}).get('price', 0)
     try:
@@ -480,7 +477,7 @@ def close_position_market(symbol, all_data, equity, reason,
             logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (market)")
             clear_peak(symbol)
             log_trade("CLOSE", symbol, 0, fill_px, reason, equity,
-                      cvd_signal, oi_signal, confluence)
+                      confluence)
             send_telegram(f"🔴 <b>CLOSE</b> (market)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
             return True
         logger.error(f"❌ CLOSE {symbol} REJECTED: {err}")
@@ -554,7 +551,6 @@ def check_pending_loc(positions, all_data, equity):
             _finalize_open(
                 symbol, direction, meta['is_buy'],
                 meta['notional_usd'], meta.get('atr_val'),
-                meta['cvd_signal'], meta['oi_signal'],
                 meta['confluence'], meta['reason'],
                 equity,
                 sym_data=all_data.get(symbol, {}),
@@ -573,7 +569,7 @@ def check_pending_loc(positions, all_data, equity):
     _save_pending_loc(pending)
 
 
-def place_loc_order(symbol, is_long, all_data, equity, cvd_signal, oi_signal):
+def place_loc_order(symbol, is_long, all_data, equity):
     """
     Limit-on-close entry. Signals are computed on the just-closed bar; this
     places one post-only limit at the 60-min EMA (the pullback level) and
@@ -621,7 +617,6 @@ def place_loc_order(symbol, is_long, all_data, equity, cvd_signal, oi_signal):
         logger.success(f"{symbol} LOC filled immediately at ${fpx:.4f}")
         return _finalize_open(
             symbol, direction, is_long, notional_usd, atr_val,
-            cvd_signal, oi_signal,
             confluence="7/7 LOC",
             reason=f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
             equity=equity, sym_data=data,
@@ -635,8 +630,6 @@ def place_loc_order(symbol, is_long, all_data, equity, cvd_signal, oi_signal):
             "limit_px":    limit_px,
             "notional_usd": notional_usd,
             "atr_val":     atr_val,
-            "cvd_signal":  cvd_signal,
-            "oi_signal":   oi_signal,
             "confluence":  "7/7 LOC",
             "reason":      f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
             "placed_at":   datetime.now().isoformat(),
@@ -846,7 +839,7 @@ def select_entry(all_data, positions):
         action  = "OPEN_LONG" if is_long else "OPEN_SHORT"
 
         # Funding gate — skip crowded-side entries
-        funding = data.get('oi', {}).get('funding', 0.0)
+        funding = data.get('funding_data', {}).get('funding', 0.0)
         if is_long and funding > FUNDING_LONG_MAX:
             logger.debug(f"  {symbol}: funding {funding:.4f}% > {FUNDING_LONG_MAX}% — skip long (crowded)")
             continue
@@ -854,15 +847,11 @@ def select_entry(all_data, positions):
             logger.debug(f"  {symbol}: funding {funding:.4f}% < {FUNDING_SHORT_MIN}% — skip short (crowded)")
             continue
 
-        # ADX gate — raise threshold when CVD disagrees with direction
-        adx_data  = data.get('adx', {})
-        adx_val   = adx_data.get('adx', 0.0)
-        cvd_trend = data.get('cvd', {}).get('cvd_trend', 'neutral')
-        cvd_agrees  = (is_long and cvd_trend == 'rising') or (not is_long and cvd_trend == 'falling')
-        required_adx = ADX_THRESHOLD if cvd_agrees else ADX_CVD_BOOST
-        if adx_val < required_adx:
-            label = "agrees" if cvd_agrees else f"disagrees → need {ADX_CVD_BOOST}"
-            logger.debug(f"  {symbol}: ADX {adx_val:.1f} < {required_adx} (CVD {label}) — skip")
+        # ADX gate
+        adx_data = data.get('adx', {})
+        adx_val  = adx_data.get('adx', 0.0)
+        if adx_val < ADX_THRESHOLD:
+            logger.debug(f"  {symbol}: ADX {adx_val:.1f} < {ADX_THRESHOLD} — skip")
             continue
 
         passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
@@ -956,14 +945,12 @@ def _check_pullback_entry(symbol, all_data, action):
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
-def log_trade(action, symbol, size, price, reason, equity,
-              cvd_signal="", oi_signal="", confluence=""):
+def log_trade(action, symbol, size, price, reason, equity, confluence=""):
     trades = load_json(TRADE_LOG, [])
     trades.append({
         "timestamp": datetime.now().isoformat(),
         "action": action, "symbol": symbol, "size": size, "price": price,
         "reason": reason, "equity": equity,
-        "cvd_signal": cvd_signal, "oi_signal": oi_signal,
         "confluence": confluence,
         "leverage": LEVERAGE, "notional": size * price
     })
@@ -975,7 +962,7 @@ def log_equity(equity, all_data, positions):
         "timestamp": datetime.now().isoformat(),
         "equity": equity,
         "prices": {sym: data['tn_price'] for sym, data in all_data.items()},
-        "volume_24h": {sym: data['oi']['day_volume'] for sym, data in all_data.items()},
+        "volume_24h": {sym: data['funding_data']['day_volume'] for sym, data in all_data.items()},
         "positions": {sym: {"side": p["side"], "size": p["size"], "entry": p["entry"]}
                       for sym, p in positions.items()}
     })
@@ -1033,7 +1020,7 @@ def print_summary(equity, positions, all_data):
                 unreal_usd = _pos_pnl(p, current_price)
                 unreal_pct = (unreal_usd / (size * entry)) * 100
                 usign2 = "+" if unreal_usd >= 0 else ""
-                funding = all_data.get(sym, {}).get('oi', {}).get('funding', 0)
+                funding = all_data.get(sym, {}).get('funding_data', {}).get('funding', 0)
                 logger.info(
                     f"  {sym}: {side} {size} | Entry ${entry:.4f} → Now ${current_price:.4f} | "
                     f"Notional: ${notional:.2f} | "
@@ -1131,10 +1118,7 @@ def run_bot():
                             f"Heat {heat_pct*100:.1f}% ≥ {MAX_PORTFOLIO_RISK_PCT*100:.0f}% cap — skipping {entry_sym}"
                         )
                     else:
-                        data       = all_data[entry_sym]
-                        cvd_signal = data.get('cvd', {}).get('cvd_trend', 'neutral')
-                        oi_signal  = data.get('oi', {}).get('oi_signal', 'stable')
-                        place_loc_order(entry_sym, is_long, all_data, equity, cvd_signal, oi_signal)
+                        place_loc_order(entry_sym, is_long, all_data, equity)
 
             positions = get_open_positions()
             equity    = get_equity()

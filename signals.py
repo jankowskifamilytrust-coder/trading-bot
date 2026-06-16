@@ -43,32 +43,6 @@ def compute_atr(candles, period=ATR_PERIOD):
         return None
 
 
-def compute_cvd(candles):
-    cvd = 0.0
-    cvd_series = []
-    for c in candles:
-        o = float(c['o']); cl = float(c['c']); v = float(c['v'])
-        h = float(c['h']); l = float(c['l'])
-        rng = h - l + 1e-9
-        delta = v * ((cl - o) / rng) if cl >= o else -v * ((o - cl) / rng)
-        cvd += delta
-        cvd_series.append(cvd)
-
-    cvd_trend = "rising" if len(cvd_series) >= 5 and cvd_series[-1] > cvd_series[-5] else "falling"
-
-    divergence = "unknown"
-    if len(candles) >= 5:
-        price_change = float(candles[-1]['c']) - float(candles[-5]['c'])
-        cvd_change = cvd_series[-1] - cvd_series[-5] if len(cvd_series) >= 5 else 0
-        if price_change > 0 and cvd_change < 0:
-            divergence = "bearish divergence (price up, CVD down)"
-        elif price_change < 0 and cvd_change > 0:
-            divergence = "bullish divergence (price down, CVD up)"
-        else:
-            divergence = "no divergence"
-
-    return {"cvd": round(cvd, 2), "cvd_trend": cvd_trend, "divergence": divergence}
-
 
 
 def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_MULT):
@@ -269,62 +243,19 @@ def compute_struct_stops(candles, lookback=5):
         return None, None
 
 
-def compute_oi(symbol, candles, price, info):
+def compute_funding(symbol, info):
     try:
         asset_contexts = info.meta_and_asset_ctxs()
         meta = asset_contexts[0]['universe']
         ctxs = asset_contexts[1]
         symbol_idx = next((i for i, a in enumerate(meta) if a['name'] == symbol), None)
         if symbol_idx is None or symbol_idx >= len(ctxs):
-            return {"oi_usd": 0, "oi_tokens": 0, "vol_change_pct": 0,
-                    "oi_vol_ratio": 0, "oi_signal": "unavailable",
-                    "funding": 0, "funding_signal": "unavailable", "day_volume": 0}
+            return {"funding": 0, "day_volume": 0}
         ctx = ctxs[symbol_idx]
-        oi_tokens = float(ctx.get('openInterest', 0))
-        funding = float(ctx.get('funding', 0)) * 100
-        day_volume = float(ctx.get('dayNtlVlm', 0))
-        oi_usd = round(oi_tokens * price, 2)
-
-        if len(candles) >= 8:
-            recent_vol = sum(float(c['v']) for c in candles[-4:])
-            prev_vol = sum(float(c['v']) for c in candles[-8:-4])
-            vol_change_pct = ((recent_vol - prev_vol) / (prev_vol + 1e-9)) * 100
-        else:
-            vol_change_pct = 0
-
-        last_vol = float(candles[-1]['v']) if candles else 1
-        oi_vol_ratio = round(oi_tokens / (last_vol + 1e-9), 2)
-
-        if vol_change_pct > 15:
-            oi_signal = "rising fast — strong conviction, new money entering"
-        elif vol_change_pct > 5:
-            oi_signal = "rising — trend has momentum"
-        elif vol_change_pct < -15:
-            oi_signal = "falling fast — positions unwinding, trend weakening"
-        elif vol_change_pct < -5:
-            oi_signal = "falling — losing momentum"
-        else:
-            oi_signal = "stable — no strong conviction either way"
-
-        if funding > 0.05:
-            funding_signal = "high positive (longs paying — crowded long, potential squeeze)"
-        elif funding > 0.01:
-            funding_signal = "positive (mild long bias)"
-        elif funding < -0.05:
-            funding_signal = "high negative (shorts paying — crowded short, potential squeeze)"
-        elif funding < -0.01:
-            funding_signal = "negative (mild short bias)"
-        else:
-            funding_signal = "neutral"
-
         return {
-            "oi_usd": oi_usd, "oi_tokens": round(oi_tokens, 2),
-            "vol_change_pct": round(vol_change_pct, 2), "oi_vol_ratio": oi_vol_ratio,
-            "oi_signal": oi_signal, "funding": round(funding, 4),
-            "funding_signal": funding_signal, "day_volume": day_volume
+            "funding":    round(float(ctx.get('funding', 0)) * 100, 4),
+            "day_volume": float(ctx.get('dayNtlVlm', 0)),
         }
     except Exception as e:
-        logger.error(f"OI fetch error for {symbol}: {e}")
-        return {"oi_usd": 0, "oi_tokens": 0, "vol_change_pct": 0,
-                "oi_vol_ratio": 0, "oi_signal": "unavailable",
-                "funding": 0, "funding_signal": "unavailable", "day_volume": 0}
+        logger.error(f"Funding fetch error for {symbol}: {e}")
+        return {"funding": 0, "day_volume": 0}
