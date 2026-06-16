@@ -9,7 +9,7 @@ from loguru import logger
 
 from config import (
     TOP_N, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
-    SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
+    SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT,
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MIN_NOTIONAL_USD, STOP_ATR_MULT,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_PCT,
     TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG,
@@ -755,6 +755,9 @@ def check_stops(positions, all_data, equity):
         if side == "LONG":
             new_peak = max(peak, price)
             if price - entry >= atr:
+                # Floor peak at entry+stop_distance to lock in BE. Note: stored peak
+                # may exceed the actual price high-water-mark by up to 2×ATR while BE
+                # is active — it is a stop anchor, not a true MFE tracker.
                 new_peak = max(new_peak, entry + stop_distance)
             chandelier_stop = new_peak - stop_distance
             if struct_stop is not None and struct_stop < entry:
@@ -817,15 +820,20 @@ def check_stops(positions, all_data, equity):
 
 def select_entry(all_data, positions):
     """
-    Evaluates all 5 entry conditions for every non-held symbol and returns
+    Evaluates all 7 entry conditions for every non-held symbol and returns
     (symbol, is_long) for the best qualifying setup (highest ADX), or (None, None).
 
-    Conditions:
+    Conditions checked here:
       C1a  Daily Supertrend direction (bullish → long, bearish → short)
-      C1b  Daily ADX > ADX_THRESHOLD
+      C1b  Daily ADX > ADX_THRESHOLD + DI direction confirmation
+      Funding gate — skip crowded-side entries
+
+    Conditions delegated to _check_pullback_entry:
+      C0   4h RSI and EMA slope in trade direction (intermediate timeframe filter)
       C2   60-min RSI dipped below RSI_LONG_THRESHOLD / spiked above RSI_SHORT_THRESHOLD
       C3   Price within ±EMA_BAND_PCT of 20-EMA on 60-min
       C4   RSI hook back in trend direction
+      C5   Current bar volume ≥ VOLUME_CONFIRM_RATIO × 10-bar average
     """
     candidates = []
     for symbol, data in all_data.items():
@@ -977,7 +985,7 @@ def log_equity(equity, all_data, positions):
         "timestamp": datetime.now().isoformat(),
         "equity": equity,
         "prices": {sym: data['tn_price'] for sym, data in all_data.items()},
-        "volume_24h": {sym: data['funding_data']['day_volume'] for sym, data in all_data.items()},
+        "volume_24h": {sym: data.get('funding_data', {}).get('day_volume', 0) for sym, data in all_data.items()},
         "positions": {sym: {"side": p["side"], "size": p["size"], "entry": p["entry"]}
                       for sym, p in positions.items()}
     })
@@ -1078,13 +1086,28 @@ def run_bot():
         with open(lockfile, 'x') as _lf:
             _lf.write(str(os.getpid()))
     except FileExistsError:
+        old_pid = "unknown"
         try:
             with open(lockfile) as _lf:
                 old_pid = _lf.read().strip()
         except Exception:
-            old_pid = "unknown"
-        logger.error(f"Lock file exists (PID {old_pid}) — another instance may be running. Exiting.")
-        raise SystemExit(1)
+            pass
+        alive = False
+        if old_pid.isdigit():
+            try:
+                os.kill(int(old_pid), 0)
+                alive = True
+            except ProcessLookupError:
+                pass          # process is dead — stale lock
+            except PermissionError:
+                alive = True  # exists but no signal permission
+        if alive:
+            logger.error(f"Lock file exists (PID {old_pid}) — another instance is running. Exiting.")
+            raise SystemExit(1)
+        logger.warning(f"Stale lockfile (PID {old_pid} dead) — removing and continuing")
+        os.remove(lockfile)
+        with open(lockfile, 'x') as _lf:
+            _lf.write(str(os.getpid()))
     atexit.register(lambda: os.path.exists(lockfile) and os.remove(lockfile))
 
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
@@ -1141,13 +1164,16 @@ def run_bot():
 
             # ── Step 2: LOC entry (only if slot available, no pending order, heat OK)
             pending_syms = set(_load_pending_loc().keys())
-            if len(positions) < MAX_POSITIONS and len(pending_syms) + len(positions) < MAX_POSITIONS:
+            if len(pending_syms) + len(positions) < MAX_POSITIONS:
                 logger.info("Scanning for entry setups...")
                 # Treat pending symbols as taken slots so select_entry skips them
                 occupied = {**positions, **{sym: {"side": "PENDING"} for sym in pending_syms}}
                 entry_sym, is_long = select_entry(all_data, occupied)
                 if entry_sym:
                     peaks = _load_peaks()
+                    # Conservative: counts full STOP_ATR_MULT×ATR for every position even if
+                    # the chandelier/BE stop has already moved to entry (actual risk ≈ 0).
+                    # Intentionally over-estimates to keep a safety margin before the cap.
                     open_risk = sum(
                         abs(p['size']) * (peaks.get(sym, {}).get('atr') or all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
                         for sym, p in positions.items()
