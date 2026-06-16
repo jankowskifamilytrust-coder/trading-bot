@@ -15,7 +15,7 @@ from loguru import logger
 from config import ADVISOR_LOG
 
 _client = None
-_MODEL = "claude-haiku-4-5-20251001"
+_MODEL = "claude-haiku-4-5"
 
 
 def _get_client():
@@ -78,7 +78,9 @@ def log_advisor_verdict(symbol, is_long, pb_reason, data):
         "error": error,
     }
     try:
-        os.makedirs(os.path.dirname(ADVISOR_LOG), exist_ok=True)
+        log_dir = os.path.dirname(ADVISOR_LOG)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         with open(ADVISOR_LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception as e:
