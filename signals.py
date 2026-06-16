@@ -24,10 +24,18 @@ def compute_daily_vol(candles):
         return None
 
 
+def _wilder(values, p):
+    """Wilder smoothing (RMA): SMA seed then (prev*(p-1) + cur) / p."""
+    if len(values) < p:
+        return []
+    result = [sum(values[:p]) / p]
+    for v in values[p:]:
+        result.append((result[-1] * (p - 1) + v) / p)
+    return result
+
+
 def compute_atr(candles, period=ATR_PERIOD):
     try:
-        if len(candles) < period + 1:
-            period = max(2, len(candles) - 1)
         trs = []
         for i in range(1, len(candles)):
             h = float(candles[i]['h'])
@@ -37,22 +45,10 @@ def compute_atr(candles, period=ATR_PERIOD):
             trs.append(tr)
         if not trs:
             return None
-        recent = trs[-period:]
-        return sum(recent) / len(recent)
+        atr_w = _wilder(trs, period)
+        return atr_w[-1] if atr_w else None
     except Exception:
         return None
-
-
-
-
-def _wilder(values, p):
-    """Wilder smoothing (RMA): SMA seed then (prev*(p-1) + cur) / p."""
-    if len(values) < p:
-        return []
-    result = [sum(values[:p]) / p]
-    for v in values[p:]:
-        result.append((result[-1] * (p - 1) + v) / p)
-    return result
 
 
 def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_MULT):

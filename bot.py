@@ -30,7 +30,7 @@ from signals import (
 from exchange import (
     mainnet_info, exchange as hl_exchange,
     get_testnet_coins, get_testnet_price_map, get_testnet_book,
-    place_alo_limit, cancel_order, get_open_positions, get_equity, wait_until,
+    place_alo_limit, cancel_order, get_open_positions, get_equity,
 )
 
 load_dotenv()
@@ -192,8 +192,13 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None):
                 logger.warning(f"{symbol}: no closed bars after dropping forming bar — skipping")
                 return None
 
-            meta = mainnet_info.meta()
-            asset_info = next((a for a in meta['universe'] if a['name'] == symbol), None)
+            universe = asset_ctxs[0]['universe'] if asset_ctxs else None
+            if universe is None:
+                try:
+                    universe = mainnet_info.meta()['universe']
+                except Exception:
+                    universe = []
+            asset_info = next((a for a in universe if a['name'] == symbol), None)
             sz_decimals = int(asset_info['szDecimals']) if asset_info else 3
 
             # Daily candles — shared by Supertrend, ADX, and ATR sizing
@@ -247,7 +252,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None):
                 "ema20_60": compute_ema(candles, period=EMA_PERIOD),
                 "vol_ratio_60": compute_volume_ratio(candles, lookback=10),
                 "struct_stops": compute_struct_stops(daily_candles, lookback=20) if daily_candles
-                               else compute_struct_stops(candles, lookback=RSI_LOOKBACK),
+                               else compute_struct_stops(candles, lookback=48),
                 "rsi_4h": rsi_4h,
                 "ema_4h_slope": ema_4h_slope,
             }
@@ -434,7 +439,6 @@ def close_position_market(symbol, all_data, equity, reason, confluence=""):
                 fill_px = float(s['filled'].get('avgPx', exec_price))
         if filled or symbol not in get_open_positions():
             logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (market)")
-            clear_peak(symbol)
             log_trade("CLOSE", symbol, pre_size, fill_px, reason, equity,
                       confluence)
             send_telegram(f"🔴 <b>CLOSE</b> (market)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
@@ -515,7 +519,11 @@ def check_pending_loc(positions, all_data, equity):
             sym_data = all_data.get(symbol)
             if sym_data is None:
                 logger.warning(f"{symbol}: not in all_data this cycle — fetching individually for LOC finalization")
-                sym_data = get_symbol_data(symbol) or {}
+                try:
+                    fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
+                except Exception:
+                    fallback_ctxs = None
+                sym_data = get_symbol_data(symbol, asset_ctxs=fallback_ctxs) or {}
             _finalize_open(
                 symbol, direction, meta['is_buy'],
                 meta['notional_usd'], meta.get('atr_val'),
@@ -650,6 +658,12 @@ def check_stops(positions, all_data, equity):
         if not atr or not price or not entry:
             continue
 
+        # Ensure peak entry exists before exit checks (ADX counter needs it)
+        if sym not in peaks:
+            peaks[sym] = {"peak": entry, "struct_stop": None, "atr": None}
+            peaks_changed = True
+        peak_data = peaks[sym]
+
         # ── 1. Supertrend exit — close whenever ST is against position ───────
         st = data.get('supertrend', {})
         st_dir = st.get('direction', 'neutral')
@@ -671,9 +685,18 @@ def check_stops(positions, all_data, equity):
                 time.sleep(1)
             continue
 
-        # ── 2. ADX decay exit ─────────────────────────────────────────────────
+        # ── 2. ADX decay exit — requires 2 consecutive bars below threshold ──
         adx_val = data.get('adx', {}).get('adx', 0.0)
         if adx_val < ADX_DECAY_EXIT:
+            decay_hits = peak_data.get('adx_decay_count', 0)
+            if decay_hits < 1:
+                peak_data['adx_decay_count'] = 1
+                peaks_changed = True
+                logger.warning(
+                    f"📉 ADX DECLINING {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} "
+                    f"— confirming next bar before exit"
+                )
+                continue
             logger.warning(
                 f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
             )
@@ -688,13 +711,10 @@ def check_stops(positions, all_data, equity):
                 closed_any = True
                 time.sleep(1)
             continue
-
-        # Ensure peak entry exists in new dict format
-        if sym not in peaks:
-            peaks[sym] = {"peak": entry, "struct_stop": None, "atr": None}
+        elif peak_data.get('adx_decay_count', 0):
+            peak_data['adx_decay_count'] = 0
             peaks_changed = True
 
-        peak_data     = peaks[sym]
         peak          = peak_data["peak"]
         struct_stop   = peak_data.get("struct_stop")
         stop_distance = STOP_ATR_MULT * atr
@@ -920,6 +940,8 @@ def log_equity(equity, all_data, positions):
         "positions": {sym: {"side": p["side"], "size": p["size"], "entry": p["entry"]}
                       for sym, p in positions.items()}
     })
+    if len(curve) > 8760:
+        curve = curve[-8760:]
     save_json(EQUITY_LOG, curve)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
@@ -1020,7 +1042,7 @@ def run_bot():
     atexit.register(lambda: os.path.exists(lockfile) and os.remove(lockfile))
 
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
-    logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 24h dollar volume")
+    logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 30-day avg daily dollar volume")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
     logger.info(f"Exits: ST against position | ADX decay <{ADX_DECAY_EXIT} | chandelier {STOP_ATR_MULT}×ATR + struct stop")
     logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")
@@ -1053,7 +1075,8 @@ def run_bot():
             positions = get_open_positions()   # refresh — LOC may have filled during market data fetch
             check_pending_loc(positions, all_data, equity)
 
-            log_equity(equity, all_data, positions)
+            if equity > 0:
+                log_equity(equity, all_data, positions)
 
             # ── Step 1: Automatic stops ────────────────────────────────────────
             if positions:
@@ -1061,7 +1084,7 @@ def run_bot():
                 if stopped:
                     time.sleep(SETTLE_SECONDS)
                     positions = get_open_positions()
-                    equity    = get_equity()
+            equity = get_equity()  # always refresh before entry decision
 
             # ── Step 2: LOC entry (only if slot available, no pending order, heat OK)
             pending_syms = set(_load_pending_loc().keys())
