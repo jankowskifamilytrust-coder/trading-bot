@@ -626,7 +626,8 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     if size_tokens < min_size:
         logger.warning(f"{symbol}: LOC size {size_tokens} below min {min_size} — skipping")
         return False
-    if size_tokens * limit_px < MIN_NOTIONAL_USD:
+    notional_floor = max(equity * MIN_NOTIONAL_PCT, MIN_NOTIONAL_USD)
+    if size_tokens * limit_px < notional_floor:
         logger.warning(f"{symbol}: LOC notional ${size_tokens * limit_px:.2f} fell below floor after rounding — skipping")
         return False
 
