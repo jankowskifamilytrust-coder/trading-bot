@@ -227,11 +227,11 @@ def compute_volume_ratio(candles, lookback=10):
     try:
         vols = [float(c['v']) for c in candles]
         if len(vols) < lookback + 1:
-            return 1.0
+            return 0.0
         avg = sum(vols[-(lookback + 1):-1]) / lookback
-        return round(vols[-1] / avg, 3) if avg > 0 else 1.0
+        return round(vols[-1] / avg, 3) if avg > 0 else 0.0
     except Exception:
-        return 1.0
+        return 0.0
 
 
 def compute_struct_stops(candles, lookback=5):

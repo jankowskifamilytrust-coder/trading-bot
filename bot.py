@@ -188,11 +188,6 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None):
                 logger.warning(f"{symbol}: no closed bars after dropping forming bar — skipping")
                 return None
 
-            candle_summary = "\n".join([
-                f"  open={c['o']} high={c['h']} low={c['l']} close={c['c']} volume={c['v']}"
-                for c in candles[-10:]
-            ])
-
             meta = mainnet_info.meta()
             asset_info = next((a for a in meta['universe'] if a['name'] == symbol), None)
             sz_decimals = int(asset_info['szDecimals']) if asset_info else 3
@@ -238,17 +233,17 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None):
             return {
                 "symbol": symbol, "price": price,
                 "tn_price": price,
-                "candle_summary": candle_summary,
                 "sz_decimals": sz_decimals,
                 "daily_vol": compute_daily_vol(candles),
-                "atr": compute_atr(daily_candles) if daily_candles else compute_atr(candles),
+                "atr": compute_atr(daily_candles) if daily_candles else None,
                 "funding_data": compute_funding(symbol, asset_ctxs),
                 "supertrend": supertrend,
                 "adx": adx,
                 "rsi_60": compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK),
                 "ema20_60": compute_ema(candles, period=EMA_PERIOD),
                 "vol_ratio_60": compute_volume_ratio(candles, lookback=10),
-                "struct_stops": compute_struct_stops(candles, lookback=RSI_LOOKBACK),
+                "struct_stops": compute_struct_stops(daily_candles, lookback=20) if daily_candles
+                               else compute_struct_stops(candles, lookback=RSI_LOOKBACK),
                 "rsi_4h": rsi_4h,
                 "ema_4h_slope": ema_4h_slope,
             }
@@ -369,82 +364,15 @@ def compute_notional(symbol, all_data, equity):
 
 # ─── Entry (post-only maker) ──────────────────────────────────────────────────
 
-def open_position(symbol, is_buy, all_data, equity,
-                  confluence, reason):
-    """
-    Post-only maker entry. Two attempts: passive (at touch), then aggressive
-    (one tick inside, toward mid). If neither fills, the trade is skipped.
-    """
-    sz_decimals = all_data[symbol].get('sz_decimals', 3)
-    notional_usd, atr_val = compute_notional(symbol, all_data, equity)
-    direction = "LONG" if is_buy else "SHORT"
-    if notional_usd is None:
-        send_telegram(f"⏭️ <b>{symbol} {direction} skipped</b>\nCannot size position safely — see logs")
-        return False
-
-    try:
-        hl_exchange.update_leverage(LEVERAGE, symbol, is_cross=True)
-    except Exception as e:
-        logger.warning(f"Could not set leverage for {symbol}: {e}")
-
-    for attempt in (1, 2):
-        best_bid, best_ask, tick, decimals = get_testnet_book(symbol)
-        if best_bid is None:
-            logger.error(f"{symbol}: no book — cannot place maker order")
-            send_telegram(f"⚠️ <b>{symbol} {direction} skipped</b>\nNo testnet order book")
-            return False
-
-        if attempt == 1:
-            limit_px = best_bid if is_buy else best_ask
-            tag = "passive"
-        else:
-            limit_px = (best_ask - tick) if is_buy else (best_bid + tick)
-            tag = "aggressive"
-        limit_px = round(limit_px, decimals)
-
-        size_tokens = round(notional_usd / limit_px, sz_decimals)
-        min_size = 10 ** (-sz_decimals)
-        if size_tokens < min_size:
-            logger.warning(f"{symbol}: size {size_tokens} below minimum {min_size} — skipping")
-            return False
-
-        logger.info(f"{symbol} {direction} maker {tag} attempt: post {size_tokens} @ ${limit_px:.{decimals}f} "
-                    f"(${notional_usd:.0f} notional)")
-
-        status, oid, fpx, fsz, err = place_alo_limit(symbol, is_buy, size_tokens, limit_px)
-
-        sym_data = all_data.get(symbol, {})
-
-        if status == 'filled':
-            return _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
-                                  confluence, reason, equity,
-                                  sym_data=sym_data)
-
-        if status == 'rejected':
-            logger.info(f"{symbol} {tag} ALO rejected (would cross / {err}) — trying next")
-            continue
-
-        if status == 'error':
-            logger.error(f"{symbol} order error: {err}")
-            send_telegram(f"⚠️ <b>{symbol} {direction} order error</b>\n{err[:200]}")
-            return False
-
-        logger.info(f"{symbol} resting (oid {oid}) — waiting up to {MAKER_WAIT_SECONDS}s for fill")
-        filled = wait_until(symbol, want_open=True, seconds=MAKER_WAIT_SECONDS)
-        if filled:
-            return _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
-                                  confluence, reason, equity,
-                                  sym_data=sym_data)
-        cancel_order(symbol, oid)
-        logger.info(f"{symbol} {tag} maker order unfilled in {MAKER_WAIT_SECONDS}s")
-
-    logger.info(f"{symbol} {direction}: no maker fill after 2 attempts — skipping (no fee paid)")
-    send_telegram(f"⏳ <b>{symbol} {direction} skipped</b>\nMaker order didn't fill (no taker fee paid)")
-    return False
 
 def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
                    confluence, reason, equity, sym_data=None):
-    pos = get_open_positions().get(symbol)
+    pos = None
+    for _ in range(3):
+        pos = get_open_positions().get(symbol)
+        if pos:
+            break
+        time.sleep(2)
     fill_px = pos['entry'] if pos else 0
     fill_sz = abs(pos['size']) if pos else 0
     logger.success(f"✅ OPEN {direction} {symbol}: {fill_sz} @ ${fill_px:.4f} (MAKER) | "
@@ -461,7 +389,7 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
             elif not is_buy and sw_high and sw_high > fill_px:
                 struct_stop = sw_high + STRUCT_STOP_BUFFER * struct_atr
     if fill_px:
-        init_peak(symbol, fill_px, struct_stop=struct_stop)
+        init_peak(symbol, fill_px, struct_stop=struct_stop, atr_val=atr_val)
     action_label = "BUY" if is_buy else "SELL"
     log_trade(action_label, symbol, fill_sz, fill_px, reason, equity,
               confluence)
@@ -521,7 +449,7 @@ def _load_peaks():
     migrated = False
     for sym, val in raw.items():
         if isinstance(val, (int, float)):
-            raw[sym] = {"peak": float(val), "opened_at": None, "struct_stop": None}
+            raw[sym] = {"peak": float(val), "struct_stop": None, "atr": None}
             migrated = True
     if migrated:
         save_json(TRAILING_STOP_LOG, raw)
@@ -530,11 +458,12 @@ def _load_peaks():
 def _save_peaks(peaks):
     save_json(TRAILING_STOP_LOG, peaks)
 
-def init_peak(symbol, entry_price, struct_stop=None):
+def init_peak(symbol, entry_price, struct_stop=None, atr_val=None):
     peaks = _load_peaks()
     peaks[symbol] = {
         "peak": entry_price,
         "struct_stop": struct_stop,
+        "atr": atr_val,
     }
     _save_peaks(peaks)
     extra = f" | struct stop ${struct_stop:.4f}" if struct_stop is not None else ""
@@ -572,12 +501,16 @@ def check_pending_loc(positions, all_data, equity):
 
         if symbol in positions:
             logger.info(f"{symbol} LOC {direction} filled while sleeping — finalizing")
+            sym_data = all_data.get(symbol)
+            if sym_data is None:
+                logger.warning(f"{symbol}: not in all_data this cycle — fetching individually for LOC finalization")
+                sym_data = get_symbol_data(symbol) or {}
             _finalize_open(
                 symbol, direction, meta['is_buy'],
                 meta['notional_usd'], meta.get('atr_val'),
                 meta['confluence'], meta['reason'],
                 equity,
-                sym_data=all_data.get(symbol, {}),
+                sym_data=sym_data,
             )
         else:
             logger.info(f"{symbol} LOC {direction} unfilled at bar close — cancelling (oid {oid})")
@@ -746,7 +679,7 @@ def check_stops(positions, all_data, equity):
 
         # Ensure peak entry exists in new dict format
         if sym not in peaks:
-            peaks[sym] = {"peak": entry, "opened_at": None, "struct_stop": None}
+            peaks[sym] = {"peak": entry, "struct_stop": None, "atr": None}
             peaks_changed = True
 
         peak_data     = peaks[sym]
@@ -846,11 +779,19 @@ def select_entry(all_data, positions):
             logger.debug(f"  {symbol}: funding {funding:.4f}% < {FUNDING_SHORT_MIN}% — skip short (crowded)")
             continue
 
-        # ADX gate
+        # ADX gate + DI direction confirmation
         adx_data = data.get('adx', {})
         adx_val  = adx_data.get('adx', 0.0)
         if adx_val < ADX_THRESHOLD:
             logger.debug(f"  {symbol}: ADX {adx_val:.1f} < {ADX_THRESHOLD} — skip")
+            continue
+        plus_di  = adx_data.get('plus_di', 0.0)
+        minus_di = adx_data.get('minus_di', 0.0)
+        if is_long and plus_di <= minus_di:
+            logger.debug(f"  {symbol}: +DI {plus_di:.1f} ≤ −DI {minus_di:.1f} — skip long (bearish DM)")
+            continue
+        if not is_long and minus_di <= plus_di:
+            logger.debug(f"  {symbol}: −DI {minus_di:.1f} ≤ +DI {plus_di:.1f} — skip short (bullish DM)")
             continue
 
         passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
@@ -899,18 +840,18 @@ def _check_pullback_entry(symbol, all_data, action):
     prev_rsi = rsi_data.get('prev_rsi', 50.0)
     rsi_4h_v = rsi_4h.get('rsi', 50.0)
 
+    pct_from_ema = None
+    pct_str = "n/a"
     if ema_val and price:
-        pct_from_ema = abs(price - ema_val) / ema_val
-        near_ema = pct_from_ema <= EMA_BAND_PCT
-        pct_str  = f"{(price - ema_val) / ema_val * 100:+.1f}%"
-    else:
-        near_ema = False
-        pct_str  = "n/a"
+        pct_from_ema = (price - ema_val) / ema_val   # signed: positive = above EMA
+        pct_str = f"{pct_from_ema * 100:+.1f}%"
     ema_str = f"${ema_val:.4f}" if ema_val else "n/a"
 
     c5 = vol_ratio >= VOLUME_CONFIRM_RATIO
 
     if action == "OPEN_LONG":
+        # Price pulling back to EMA from above: allow up to 2% below, 0.5% above
+        near_ema = pct_from_ema is not None and -EMA_BAND_PCT <= pct_from_ema <= EMA_BAND_PCT / 4
         c0 = (rsi_4h_v > 50) and (slope == "up")
         c2 = rsi_data.get('min_recent', 50.0) < RSI_LONG_THRESHOLD
         c3 = near_ema
@@ -924,6 +865,8 @@ def _check_pullback_entry(symbol, all_data, action):
             f"C5(vol={vol_ratio:.2f}≥{VOLUME_CONFIRM_RATIO})={'✓' if c5 else '✗'}"
         )
     elif action == "OPEN_SHORT":
+        # Price bouncing up to EMA from below: allow 0.5% below, up to 2% above
+        near_ema = pct_from_ema is not None and -EMA_BAND_PCT / 4 <= pct_from_ema <= EMA_BAND_PCT
         c0 = (rsi_4h_v < 50) and (slope == "down")
         c2 = rsi_data.get('max_recent', 50.0) > RSI_SHORT_THRESHOLD
         c3 = near_ema
@@ -1106,8 +1049,9 @@ def run_bot():
                 occupied = {**positions, **{sym: {"side": "PENDING"} for sym in pending_syms}}
                 entry_sym, is_long = select_entry(all_data, occupied)
                 if entry_sym:
+                    peaks = _load_peaks()
                     open_risk = sum(
-                        abs(p['size']) * (all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
+                        abs(p['size']) * (peaks.get(sym, {}).get('atr') or all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
                         for sym, p in positions.items()
                     )
                     heat_pct = open_risk / equity if equity > 0 else 0

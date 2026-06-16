@@ -16,18 +16,22 @@ testnet_info = Info(constants.TESTNET_API_URL, skip_ws=True)
 exchange = Exchange(wallet, constants.TESTNET_API_URL)
 
 _TESTNET_COINS = None
+_TESTNET_COINS_TS = 0.0
+_TESTNET_COINS_TTL = 24 * 3600
 
 
 def get_testnet_coins():
-    global _TESTNET_COINS
-    if _TESTNET_COINS is None:
+    global _TESTNET_COINS, _TESTNET_COINS_TS
+    if _TESTNET_COINS is None or time.time() - _TESTNET_COINS_TS > _TESTNET_COINS_TTL:
         try:
             meta = testnet_info.meta()
             _TESTNET_COINS = {a['name'] for a in meta['universe']}
+            _TESTNET_COINS_TS = time.time()
             logger.info(f"Testnet supports {len(_TESTNET_COINS)} tradeable perps")
         except Exception as e:
             logger.error(f"Could not fetch testnet coins: {e}")
-            _TESTNET_COINS = set()
+            if _TESTNET_COINS is None:
+                _TESTNET_COINS = set()
     return _TESTNET_COINS
 
 
@@ -95,7 +99,10 @@ def place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=False):
                 f = s['filled']
                 return 'filled', f.get('oid'), float(f.get('avgPx', limit_px)), float(f.get('totalSz', size_tokens)), ''
             if 'error' in s:
-                return 'rejected', None, None, None, s['error']
+                err_msg = s['error']
+                if 'immediately' in err_msg.lower() or 'post only' in err_msg.lower():
+                    return 'rejected', None, None, None, err_msg
+                return 'error', None, None, None, err_msg
         return 'error', None, None, None, f"unexpected response: {result}"
     except Exception as e:
         return 'error', None, None, None, str(e)
