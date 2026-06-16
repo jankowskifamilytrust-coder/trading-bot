@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from config import (
-    TOP_N, PINNED, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
+    TOP_N, STABLECOINS, MAX_POSITIONS, LEVERAGE, INTERVAL_MINUTES,
     SLIPPAGE, SETTLE_SECONDS, MAX_ORACLE_GAP_PCT, MAKER_WAIT_SECONDS,
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MIN_NOTIONAL_USD, STOP_ATR_MULT,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_PCT,
@@ -135,15 +135,6 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
 
         top = [sym for sym, _ in ranking[:top_n]]
 
-        testnet_coins = get_testnet_coins()
-        for sym in PINNED:
-            if sym not in top:
-                if testnet_coins and sym not in testnet_coins:
-                    logger.info(f"  Pin {sym} not on testnet — skipping")
-                    continue
-                top.append(sym)
-                logger.info(f"  Pinning {sym} (not in top {top_n})")
-
         for sym in extra_symbols:
             if sym not in top:
                 top.append(sym)
@@ -151,13 +142,12 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
 
         logger.info(f"Top {top_n} testnet perps by 30-day avg $ volume:")
         for rank, (sym, vol) in enumerate(ranking[:top_n], 1):
-            pin_tag = " [PINNED]" if sym in PINNED else ""
-            logger.info(f"  #{rank} {sym}: ${vol:,.0f}/day{pin_tag}")
+            logger.info(f"  #{rank} {sym}: ${vol:,.0f}/day")
 
         return top
     except Exception as e:
         logger.error(f"Failed to rank symbols: {e}")
-        return list(set(["BTC", "ETH", "SOL", "HYPE"] + extra_symbols))
+        return list(set(["BTC", "ETH"] + extra_symbols))
 
 # ─── Market Data ──────────────────────────────────────────────────────────────
 
@@ -1057,7 +1047,6 @@ def print_summary(equity, positions, all_data):
 def run_bot():
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
     logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 24h dollar volume")
-    logger.info(f"Pinned symbols: {', '.join(PINNED)}")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
     logger.info(f"Exits: ST against position | ADX decay <{ADX_DECAY_EXIT} | chandelier {STOP_ATR_MULT}×ATR + struct stop")
     logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional floor ${MIN_NOTIONAL_USD} | cap {MAX_NOTIONAL_PCT*100:.0f}% equity")

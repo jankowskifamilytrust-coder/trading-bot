@@ -1,5 +1,4 @@
 TOP_N = 10
-PINNED = ["BTC", "ETH", "SOL", "HYPE"]
 STABLECOINS = {
     # USD-pegged
     "USDC", "USDC0", "USDT", "USDT0", "USDHL",
