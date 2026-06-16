@@ -19,7 +19,7 @@ SETTLE_SECONDS = 3
 
 # Per-dex position caps. HIP-3 (xyz) uses an isolated clearinghouse, so each dex
 # is its own sub-portfolio. Standard keeps the backtested cap of 3; xyz capped at 1.
-MAX_POSITIONS_PER_DEX = {"": 3, "xyz": 1}
+MAX_POSITIONS_PER_DEX = {"": 3, "xyz": 0}
 
 RISK_PER_TRADE_PCT   = 0.025   # fraction of equity risked per stop-out
 MAX_PORTFOLIO_RISK_PCT = 0.075  # standard-dex heat cap (kept for back-references); see *_PER_DEX

@@ -93,20 +93,23 @@ def sleep_until_next_hour():
 
 def build_volume_ranking():
     """
-    Fetch 30-day daily candles for non-stablecoin symbols across BOTH the standard
-    perp dex and the xyz HIP-3 dex, and compute average daily dollar volume
-    (v × close). Pre-filters by 24h vol to bound API calls. Results cached in
-    VOLUME_RANK_LOG. Returns [[symbol, avg_vol_usd], ...] sorted descending.
-    xyz symbols carry the 'xyz:' prefix in their names.
+    Fetch 30-day daily candles for non-stablecoin symbols on the standard perp dex
+    and compute average daily dollar volume (v × close). Pre-filters by 24h vol to
+    bound API calls. Results cached in VOLUME_RANK_LOG.
+    Returns [[symbol, avg_vol_usd], ...] sorted descending.
+
+    Universe is standard-dex only: xyz HIP-3 perps are excluded since the xyz
+    position cap is 0 (see MAX_POSITIONS_PER_DEX) — including them would crowd out
+    tradeable std names and waste API calls. The dual-dex plumbing in exchange.py
+    remains so any pre-existing xyz position is still managed by the stop logic.
     """
-    logger.info("Building 30-day avg volume ranking across std + xyz dexes (runs once per day)...")
+    logger.info("Building 30-day avg volume ranking (standard dex, runs once per day)...")
     end_ms   = int(time.time() * 1000)
     start_ms = end_ms - 30 * 24 * 60 * 60 * 1000
 
-    # Candidate pool across both dexes, pre-sorted by 24h vol. Standard dex is
-    # large so cap to its top-50; xyz dex is small (~91) so include all of it.
+    # Candidate pool, pre-sorted by 24h vol. Standard dex is large so cap to top-50.
     candidates = []
-    for dex, cap in (("", 50), ("xyz", None)):
+    for dex, cap in (("", 50),):
         try:
             meta_ctxs = meta_and_ctxs(dex)
             universe, ctxs = meta_ctxs[0]['universe'], meta_ctxs[1]

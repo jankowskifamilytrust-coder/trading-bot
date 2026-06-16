@@ -24,9 +24,18 @@ from config import (
     RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_BAND_PCT, EMA_PERIOD, VOLUME_CONFIRM_RATIO,
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MAX_POSITIONS,
+    MAX_POSITIONS_PER_DEX,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_USD, MIN_NOTIONAL_PCT,
     FUNDING_LONG_MAX, FUNDING_SHORT_MIN,
 )
+
+# When True, model the live bot's per-dex position caps (e.g. std<=3, xyz<=1)
+# on the shared equity pool instead of one global MAX_POSITIONS gate.
+USE_PER_DEX_CAPS = False
+
+
+def _dex_of(sym):
+    return "xyz" if sym.startswith("xyz:") else ""
 
 INITIAL_EQUITY = 10000.0
 LOOKBACK_DAYS  = 5 * 365 + 90  # 5 years of daily data + warmup buffer
@@ -499,7 +508,19 @@ def run(symbols, daily, h4, funding=None):
 
         # ── Check entries ──────────────────────────────────────────────────
         occupied = set(positions.keys()) | set(pending_loc.keys())
-        if len(occupied) < MAX_POSITIONS:
+        if USE_PER_DEX_CAPS:
+            occ_by_dex = {}
+            for s in occupied:
+                d = _dex_of(s)
+                occ_by_dex[d] = occ_by_dex.get(d, 0) + 1
+            total_cap = sum(MAX_POSITIONS_PER_DEX.values())
+            cap_ok    = len(occupied) < total_cap
+            heat_cap  = total_cap * RISK_PER_TRADE_PCT
+        else:
+            cap_ok   = len(occupied) < MAX_POSITIONS
+            heat_cap = MAX_PORTFOLIO_RISK_PCT
+
+        if cap_ok:
             # Heat check
             open_risk = sum(
                 abs(p['size']) * (p['entry_atr'] or 0) * STOP_ATR_MULT
@@ -508,11 +529,15 @@ def run(symbols, daily, h4, funding=None):
             open_risk += (len(pending_loc) + 1) * RISK_PER_TRADE_PCT * equity
             heat = open_risk / equity if equity > 0 else 0
 
-            if heat < MAX_PORTFOLIO_RISK_PCT:
+            if heat < heat_cap:
                 candidates = []
                 for sym in symbols:
                     if sym in occupied:
                         continue
+                    if USE_PER_DEX_CAPS:
+                        d = _dex_of(sym)
+                        if occ_by_dex.get(d, 0) >= MAX_POSITIONS_PER_DEX.get(d, 0):
+                            continue  # this dex's slots are full
                     sig = sigs.get(sym)
                     if not sig:
                         continue
