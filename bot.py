@@ -632,6 +632,7 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
         f"(market ${price:.{decimals}f}) | {size_tokens} tokens (${notional_usd:.0f} notional)"
     )
 
+    reason = f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})"
     status, oid, fpx, fsz, err = place_alo_limit(symbol, is_long, size_tokens, limit_px)
 
     if status == 'filled':
@@ -639,7 +640,7 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
         return _finalize_open(
             symbol, direction, is_long, notional_usd, atr_val,
             confluence=confluence,
-            reason=f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
+            reason=reason,
             equity=equity, sym_data=data,
         )
 
@@ -652,7 +653,7 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
             "notional_usd": notional_usd,
             "atr_val":     atr_val,
             "confluence":  confluence,
-            "reason":      f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
+            "reason":      reason,
         }
         _save_pending_loc(pending)
         logger.info(
@@ -1203,7 +1204,7 @@ def run_bot():
                 entry_sym, is_long, pb_reason = select_entry(all_data, occupied)
                 if entry_sym:
                     peaks = _load_peaks()
-                    # Open-position risk: conservative full 3×ATR even for BE-locked trades.
+                    # Open-position risk: full STOP_ATR_MULT×ATR even for BE-locked trades.
                     # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
                     # Prospective entry: +1 trade's worth so we can't step over the cap.
                     open_risk = sum(
