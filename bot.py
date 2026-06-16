@@ -626,6 +626,9 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     if size_tokens < min_size:
         logger.warning(f"{symbol}: LOC size {size_tokens} below min {min_size} — skipping")
         return False
+    if size_tokens * limit_px < MIN_NOTIONAL_USD:
+        logger.warning(f"{symbol}: LOC notional ${size_tokens * limit_px:.2f} fell below floor after rounding — skipping")
+        return False
 
     logger.info(
         f"{symbol} {direction} LOC: limit at EMA ${limit_px:.{decimals}f} "
@@ -852,7 +855,7 @@ def check_stops(positions, all_data, equity):
 def select_entry(all_data, positions):
     """
     Evaluates all 7 entry conditions for every non-held symbol and returns
-    (symbol, is_long) for the best qualifying setup (highest ADX), or (None, None).
+    (symbol, is_long, reason) for the best qualifying setup (highest ADX), or (None, None, "").
 
     Conditions checked here:
       C1a  Daily Supertrend direction (bullish → long, bearish → short)
