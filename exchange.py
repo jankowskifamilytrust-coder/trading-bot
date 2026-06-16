@@ -7,7 +7,6 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 from loguru import logger
 
-from config import MAKER_WAIT_SECONDS, SLIPPAGE
 
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
@@ -151,14 +150,3 @@ def get_equity():
         return 0.0
 
 
-def wait_until(symbol, want_open, seconds):
-    """Poll positions until symbol is open (want_open=True) or closed (False), or timeout."""
-    waited = 0
-    step = 10
-    while waited < seconds:
-        time.sleep(min(step, seconds - waited))
-        waited += step
-        is_open = symbol in get_open_positions()
-        if is_open == want_open:
-            return True
-    return (symbol in get_open_positions()) == want_open

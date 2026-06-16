@@ -564,7 +564,7 @@ def check_pending_loc(positions, all_data, equity):
     _save_pending_loc(pending)
 
 
-def place_loc_order(symbol, is_long, all_data, equity):
+def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     """
     Limit-on-close entry. Signals are computed on the just-closed bar; this
     places one post-only limit at the 60-min EMA (the pullback level) and
@@ -577,6 +577,8 @@ def place_loc_order(symbol, is_long, all_data, equity):
     sz_decimals = data.get('sz_decimals', 3)
     direction   = "LONG" if is_long else "SHORT"
     adx_val     = data.get('adx', {}).get('adx', 0)
+    st_dir      = data.get('supertrend', {}).get('direction', 'neutral')
+    confluence  = f"ST={st_dir.upper()} ADX={adx_val:.1f} | {pb_reason}" if pb_reason else "LOC"
 
     if not ema_val:
         logger.warning(f"{symbol}: no EMA — cannot compute LOC price")
@@ -636,7 +638,7 @@ def place_loc_order(symbol, is_long, all_data, equity):
         logger.success(f"{symbol} LOC filled immediately at ${fpx:.4f}")
         return _finalize_open(
             symbol, direction, is_long, notional_usd, atr_val,
-            confluence="7/7 LOC",
+            confluence=confluence,
             reason=f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
             equity=equity, sym_data=data,
         )
@@ -773,11 +775,12 @@ def check_stops(positions, all_data, equity):
         # ── 4. Chandelier stop + structural floor ─────────────────────────────
         if side == "LONG":
             new_peak = max(peak, price)
-            if price - entry >= atr:
-                # Floor peak at entry+stop_distance to lock in BE. Note: stored peak
-                # may exceed the actual price high-water-mark by up to 2×ATR while BE
-                # is active — it is a stop anchor, not a true MFE tracker.
-                new_peak = max(new_peak, entry + stop_distance)
+            if price - entry >= entry_atr:
+                # Floor peak at the BE anchor using entry ATR for the threshold so both
+                # the trigger and the activation check use the same distance. Note: stored
+                # peak may exceed the actual price high-water-mark while BE is active —
+                # it is a stop anchor, not a true MFE tracker.
+                new_peak = max(new_peak, entry + be_stop_dist)
             chandelier_stop = new_peak - stop_distance
             if struct_stop is not None and struct_stop < entry:
                 chandelier_stop = max(chandelier_stop, struct_stop)
@@ -788,8 +791,8 @@ def check_stops(positions, all_data, equity):
             breached   = price <= stop_price
         else:
             new_peak = min(peak, price)
-            if entry - price >= atr:
-                new_peak = min(new_peak, entry - stop_distance)
+            if entry - price >= entry_atr:
+                new_peak = min(new_peak, entry - be_stop_dist)
             chandelier_stop = new_peak + stop_distance
             if struct_stop is not None and struct_stop > entry:
                 chandelier_stop = min(chandelier_stop, struct_stop)
@@ -898,20 +901,20 @@ def select_entry(all_data, positions):
             continue
 
         logger.info(f"  {symbol} {action}: SETUP READY — ADX={adx_val:.1f} | {pb_reason}")
-        candidates.append((symbol, is_long, adx_val))
+        candidates.append((symbol, is_long, adx_val, pb_reason))
 
     if not candidates:
         logger.info("No entry setup ready this cycle")
-        return None, None
+        return None, None, ""
 
     candidates.sort(key=lambda x: x[2], reverse=True)
-    best_sym, best_is_long, best_adx = candidates[0]
+    best_sym, best_is_long, best_adx, best_reason = candidates[0]
     direction = "LONG" if best_is_long else "SHORT"
     logger.info(
         f"Best entry: {best_sym} {direction} (ADX={best_adx:.1f}) "
         f"— {len(candidates)} setup(s) qualified"
     )
-    return best_sym, best_is_long
+    return best_sym, best_is_long, best_reason
 
 # ─── Entry Conditions ─────────────────────────────────────────────────────────
 
@@ -1189,16 +1192,17 @@ def run_bot():
                 logger.info("Scanning for entry setups...")
                 # Treat pending symbols as taken slots so select_entry skips them
                 occupied = {**positions, **{sym: {"side": "PENDING"} for sym in pending_syms}}
-                entry_sym, is_long = select_entry(all_data, occupied)
+                entry_sym, is_long, pb_reason = select_entry(all_data, occupied)
                 if entry_sym:
                     peaks = _load_peaks()
-                    # Conservative: counts full STOP_ATR_MULT×ATR for every position even if
-                    # the chandelier/BE stop has already moved to entry (actual risk ≈ 0).
-                    # Intentionally over-estimates to keep a safety margin before the cap.
+                    # Open-position risk: conservative full 3×ATR even for BE-locked trades.
+                    # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
+                    # Prospective entry: +1 trade's worth so we can't step over the cap.
                     open_risk = sum(
                         abs(p['size']) * (peaks.get(sym, {}).get('atr') or all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
                         for sym, p in positions.items()
                     )
+                    open_risk += (len(pending_syms) + 1) * RISK_PER_TRADE_PCT * equity
                     heat_pct = open_risk / equity if equity > 0 else 0
                     logger.info(f"Portfolio heat: ${open_risk:.2f} = {heat_pct*100:.1f}% of equity")
                     if heat_pct >= MAX_PORTFOLIO_RISK_PCT:
@@ -1206,7 +1210,7 @@ def run_bot():
                             f"Heat {heat_pct*100:.1f}% ≥ {MAX_PORTFOLIO_RISK_PCT*100:.0f}% cap — skipping {entry_sym}"
                         )
                     else:
-                        place_loc_order(entry_sym, is_long, all_data, equity)
+                        place_loc_order(entry_sym, is_long, all_data, equity, pb_reason)
 
             positions = get_open_positions()
             equity    = get_equity()
