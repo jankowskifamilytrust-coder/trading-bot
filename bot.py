@@ -17,7 +17,7 @@ from config import (
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
     EMA_PERIOD, EMA_BAND_PCT,
     FUNDING_LONG_MAX, FUNDING_SHORT_MIN, ADX_DECAY_EXIT,
-    VOLUME_CONFIRM_RATIO, MAX_HOLD_HOURS, STRUCT_STOP_BUFFER,
+    VOLUME_CONFIRM_RATIO, STRUCT_STOP_BUFFER,
 )
 from notify import send_telegram
 from signals import (
@@ -509,7 +509,6 @@ def init_peak(symbol, entry_price, struct_stop=None):
     peaks = _load_peaks()
     peaks[symbol] = {
         "peak": entry_price,
-        "opened_at": datetime.now().isoformat(),
         "struct_stop": struct_stop,
     }
     _save_peaks(peaks)
@@ -679,28 +678,26 @@ def check_stops(positions, all_data, equity):
         if not atr or not price or not entry:
             continue
 
-        # ── 1. Supertrend flip exit ───────────────────────────────────────────
+        # ── 1. Supertrend exit — close whenever ST is against position ───────
         st = data.get('supertrend', {})
-        if st.get('changed'):
-            st_dir = st.get('direction', 'neutral')
-            flip_against = (side == "LONG" and st_dir == "bearish") or \
-                           (side == "SHORT" and st_dir == "bullish")
-            if flip_against:
-                logger.warning(
-                    f"🔄 ST FLIP EXIT {sym} {side}: daily Supertrend just flipped "
-                    f"to {st_dir.upper()} — closing immediately"
-                )
-                send_telegram(
-                    f"🔄 <b>SUPERTREND FLIP EXIT {sym} {side}</b>\n"
-                    f"Daily ST flipped to {st_dir.upper()} — market close"
-                )
-                if close_position_market(sym, all_data, equity,
-                                         f"Supertrend flipped to {st_dir}"):
-                    clear_peak(sym)
-                    peaks.pop(sym, None)
-                    closed_any = True
-                    time.sleep(1)
-                continue
+        st_dir = st.get('direction', 'neutral')
+        st_against = (side == "LONG" and st_dir == "bearish") or \
+                     (side == "SHORT" and st_dir == "bullish")
+        if st_against:
+            logger.warning(
+                f"🔄 ST EXIT {sym} {side}: Supertrend is {st_dir.upper()} — closing"
+            )
+            send_telegram(
+                f"🔄 <b>SUPERTREND EXIT {sym} {side}</b>\n"
+                f"ST direction is {st_dir.upper()} — market close"
+            )
+            if close_position_market(sym, all_data, equity,
+                                     f"Supertrend {st_dir}"):
+                clear_peak(sym)
+                peaks.pop(sym, None)
+                closed_any = True
+                time.sleep(1)
+            continue
 
         # ── 2. ADX decay exit ─────────────────────────────────────────────────
         adx_val = data.get('adx', {}).get('adx', 0.0)
@@ -727,33 +724,8 @@ def check_stops(positions, all_data, equity):
 
         peak_data     = peaks[sym]
         peak          = peak_data["peak"]
-        opened_at     = peak_data.get("opened_at")
         struct_stop   = peak_data.get("struct_stop")
         stop_distance = STOP_ATR_MULT * atr
-
-        # ── 3. Time exit (no break-even after MAX_HOLD_HOURS) ─────────────────
-        if opened_at:
-            try:
-                hours_held = (datetime.now() - datetime.fromisoformat(opened_at)).total_seconds() / 3600
-                be_reached = (side == "LONG"  and peak >= entry + stop_distance) or \
-                             (side == "SHORT" and peak <= entry - stop_distance)
-                if hours_held > MAX_HOLD_HOURS and not be_reached:
-                    logger.warning(
-                        f"⏱ TIME EXIT {sym} {side}: held {hours_held:.1f}h without break-even"
-                    )
-                    send_telegram(
-                        f"⏱ <b>TIME EXIT {sym} {side}</b>\n"
-                        f"Held {hours_held:.1f}h without reaching break-even"
-                    )
-                    if close_position_market(sym, all_data, equity,
-                                             f"Time exit ({hours_held:.1f}h, no break-even)"):
-                        clear_peak(sym)
-                        peaks.pop(sym, None)
-                        closed_any = True
-                        time.sleep(1)
-                    continue
-            except Exception as e:
-                logger.debug(f"Time exit check for {sym} failed: {e}")
 
         # ── 4. Chandelier stop + structural floor ─────────────────────────────
         if side == "LONG":
@@ -1059,7 +1031,7 @@ def run_bot():
     logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 24h dollar volume")
     logger.info(f"Pinned symbols: {', '.join(PINNED)}")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
-    logger.info(f"Exits: ST flip | ADX decay <{ADX_DECAY_EXIT} | time >{MAX_HOLD_HOURS}h | chandelier {STOP_ATR_MULT}×ATR + struct stop")
+    logger.info(f"Exits: ST against position | ADX decay <{ADX_DECAY_EXIT} | chandelier {STOP_ATR_MULT}×ATR + struct stop")
     logger.info(f"Sizing: ATR-BASED {RISK_PER_TRADE_PCT*100:.0f}% equity risk/trade | portfolio cap {MAX_PORTFOLIO_RISK_PCT*100:.0f}% | notional ${MIN_NOTIONAL_USD}–${MAX_NOTIONAL_USD}")
     logger.info(f"Stop: chandelier {STOP_ATR_MULT}×ATR trailing | Break-even lock at +1×ATR")
     logger.info(f"Leverage: {LEVERAGE}x | Max positions: {MAX_POSITIONS} | Gap skip: >{MAX_ORACLE_GAP_PCT}%")
@@ -1071,7 +1043,7 @@ def run_bot():
         "🤖 <b>Trading Bot Started</b>\n"
         f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max {MAX_POSITIONS}\n"
         f"Entries: rule-based (ST + ADX + pullback) | Post-only maker\n"
-        f"Exits: ST flip | ADX decay | time {MAX_HOLD_HOURS}h | chandelier {STOP_ATR_MULT}×ATR\n"
+        f"Exits: ST against position | ADX decay | chandelier {STOP_ATR_MULT}×ATR\n"
         "Data: MAINNET | Trading: TESTNET"
     )
 
