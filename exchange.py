@@ -118,7 +118,10 @@ def cancel_order(symbol, oid):
         logger.warning(f"Cancel {symbol} oid {oid} failed (may have already filled): {e}")
 
 
+_last_positions: dict = {}
+
 def get_open_positions():
+    global _last_positions
     positions = {}
     try:
         state = testnet_info.user_state(wallet.address)
@@ -132,9 +135,11 @@ def get_open_positions():
                     "size": size, "entry": entry,
                     "side": "LONG" if size > 0 else "SHORT"
                 }
+        _last_positions = positions
+        return positions
     except Exception as e:
-        logger.error(f"Position check error: {e}")
-    return positions
+        logger.error(f"Position check error: {e} — returning last known positions")
+        return _last_positions
 
 
 def get_equity():

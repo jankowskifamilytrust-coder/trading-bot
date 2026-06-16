@@ -1,4 +1,5 @@
 import os
+import atexit
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -115,6 +116,9 @@ def build_volume_ranking():
         results = [f.result() for f in as_completed(futures)]
 
     results.sort(key=lambda x: x[1], reverse=True)
+    if all(vol == 0.0 for _, vol in results):
+        logger.error("Volume ranking: all symbols returned 0 volume — possible mass API failure")
+        send_telegram("⚠️ <b>Volume ranking failed</b>\nAll symbols returned 0 volume — API may be down")
     ranking = [[sym, vol] for sym, vol in results]
     save_json(VOLUME_RANK_LOG, {"computed_at": datetime.now().isoformat(), "ranking": ranking})
     logger.info(f"30-day ranking built. Top 10: {[r[0] for r in ranking[:10]]}")
@@ -291,6 +295,8 @@ def get_all_market_data(symbols, open_position_syms=None):
             wide_gap.append(f"{sym} ({info_px['gap_pct']:.1f}%)")
             del all_data[sym]
             continue
+        if not info_px:
+            logger.warning(f"  {sym}: testnet price unavailable — using mainnet price, oracle gap check skipped")
         all_data[sym]['tn_price'] = info_px['price'] if info_px else all_data[sym]['price']
 
     if wide_gap:
@@ -451,6 +457,10 @@ def _load_peaks():
         if isinstance(val, (int, float)):
             raw[sym] = {"peak": float(val), "struct_stop": None, "atr": None}
             migrated = True
+        elif isinstance(val, dict) and 'atr' not in val:
+            raw[sym].pop('opened_at', None)
+            raw[sym]['atr'] = None
+            migrated = True
     if migrated:
         save_json(TRAILING_STOP_LOG, raw)
     return raw
@@ -499,7 +509,8 @@ def check_pending_loc(positions, all_data, equity):
         oid       = meta['oid']
         direction = "LONG" if meta['is_buy'] else "SHORT"
 
-        if symbol in positions:
+        expected_side = "LONG" if meta['is_buy'] else "SHORT"
+        if symbol in positions and positions[symbol]['side'] == expected_side:
             logger.info(f"{symbol} LOC {direction} filled while sleeping — finalizing")
             sym_data = all_data.get(symbol)
             if sym_data is None:
@@ -605,7 +616,8 @@ def place_loc_order(symbol, is_long, all_data, equity):
         )
         return True
 
-    logger.info(f"{symbol} LOC {status}: {err}")
+    logger.warning(f"{symbol} LOC {direction} could not rest: {status} — {err}")
+    send_telegram(f"⚠️ <b>{symbol} {direction} LOC failed to rest</b>\n{status}: {err[:200]}")
     return False
 
 
@@ -653,8 +665,8 @@ def check_stops(positions, all_data, equity):
             )
             if close_position_market(sym, all_data, equity,
                                      f"Supertrend {st_dir}"):
-                clear_peak(sym)
                 peaks.pop(sym, None)
+                peaks_changed = True
                 closed_any = True
                 time.sleep(1)
             continue
@@ -671,8 +683,8 @@ def check_stops(positions, all_data, equity):
             )
             if close_position_market(sym, all_data, equity,
                                      f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
-                clear_peak(sym)
                 peaks.pop(sym, None)
+                peaks_changed = True
                 closed_any = True
                 time.sleep(1)
             continue
@@ -733,8 +745,8 @@ def check_stops(positions, all_data, equity):
             )
             if close_position_market(sym, all_data, equity,
                                      f"{stop_label} at ${stop_price:.4f}"):
-                clear_peak(sym)
                 peaks.pop(sym, None)
+                peaks_changed = True
                 closed_any = True
                 time.sleep(1)
 
@@ -997,6 +1009,16 @@ def print_summary(equity, positions, all_data):
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 
 def run_bot():
+    lockfile = "/tmp/trading_bot.lock"
+    if os.path.exists(lockfile):
+        with open(lockfile) as _lf:
+            old_pid = _lf.read().strip()
+        logger.error(f"Lock file exists (PID {old_pid}) — another instance may be running. Exiting.")
+        raise SystemExit(1)
+    with open(lockfile, 'w') as _lf:
+        _lf.write(str(os.getpid()))
+    atexit.register(lambda: os.path.exists(lockfile) and os.remove(lockfile))
+
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
     logger.info(f"Dynamic selection: TOP {TOP_N} testnet-tradeable perps by 24h dollar volume")
     logger.info(f"Entries: RULE-BASED (Supertrend + ADX + pullback) — post-only maker")
@@ -1072,7 +1094,7 @@ def run_bot():
         except Exception as e:
             logger.error(f"Error: {e}")
             send_telegram(f"⚠️ <b>Bot Error</b>\n{str(e)[:300]}")
-            time.sleep(60)
+            sleep_until_next_hour()
 
 if __name__ == "__main__":
     run_bot()

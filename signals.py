@@ -45,6 +45,16 @@ def compute_atr(candles, period=ATR_PERIOD):
 
 
 
+def _wilder(values, p):
+    """Wilder smoothing (RMA): SMA seed then (prev*(p-1) + cur) / p."""
+    if len(values) < p:
+        return []
+    result = [sum(values[:p]) / p]
+    for v in values[p:]:
+        result.append((result[-1] * (p - 1) + v) / p)
+    return result
+
+
 def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_MULT):
     """
     Daily Supertrend bias filter.
@@ -60,15 +70,12 @@ def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_
         L = [float(c['l']) for c in candles]
         C = [float(c['c']) for c in candles]
 
-        # True Range (index 0 unused; TR[i] = TR of candle[i])
-        TR = [0.0] + [max(H[i] - L[i], abs(H[i] - C[i-1]), abs(L[i] - C[i-1]))
-                      for i in range(1, n)]
-
-        # ATR per bar — simple MA over `period` TR values
-        ATR = [0.0] * n
-        for i in range(1, n):
-            start = max(1, i - period + 1)
-            ATR[i] = sum(TR[start:i+1]) / (i - start + 1)
+        # True Range and Wilder RMA ATR (matches TradingView canonical Supertrend)
+        tr_vals = [max(H[i] - L[i], abs(H[i] - C[i-1]), abs(L[i] - C[i-1]))
+                   for i in range(1, n)]
+        atr_w = _wilder(tr_vals, period)   # atr_w[j] = ATR for candle index (period + j)
+        if not atr_w:
+            return {"direction": "neutral", "value": 0.0, "changed": False}
 
         # Bands and Supertrend (computed from index `period` onward)
         fu = [0.0] * n   # final upper band
@@ -76,14 +83,17 @@ def compute_supertrend(candles, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_
         st = [0.0] * n   # supertrend value
 
         hl2 = (H[period] + L[period]) / 2
-        fu[period] = hl2 + multiplier * ATR[period]
-        fl[period] = hl2 - multiplier * ATR[period]
+        fu[period] = hl2 + multiplier * atr_w[0]
+        fl[period] = hl2 - multiplier * atr_w[0]
         st[period] = fl[period]  # start bullish
 
         for i in range(period + 1, n):
+            j = i - period
+            if j >= len(atr_w):
+                break
             hl2 = (H[i] + L[i]) / 2
-            bu = hl2 + multiplier * ATR[i]
-            bl = hl2 - multiplier * ATR[i]
+            bu = hl2 + multiplier * atr_w[j]
+            bl = hl2 - multiplier * atr_w[j]
 
             # Trailing bands: tighten upper, raise lower — using previous close
             fu[i] = bu if (bu < fu[i-1] or C[i-1] > fu[i-1]) else fu[i-1]
@@ -131,18 +141,9 @@ def compute_adx(candles, period=ADX_PERIOD):
             pdm_vals.append(up   if up > down and up > 0   else 0.0)
             mdm_vals.append(down if down > up and down > 0 else 0.0)
 
-        def wilder(values, p):
-            """Wilder smoothing (RMA): SMA seed, then (prev*(p-1) + cur) / p."""
-            if len(values) < p:
-                return []
-            result = [sum(values[:p]) / p]
-            for v in values[p:]:
-                result.append((result[-1] * (p - 1) + v) / p)
-            return result
-
-        atr_s = wilder(tr_vals,  period)
-        pdm_s = wilder(pdm_vals, period)
-        mdm_s = wilder(mdm_vals, period)
+        atr_s = _wilder(tr_vals,  period)
+        pdm_s = _wilder(pdm_vals, period)
+        mdm_s = _wilder(mdm_vals, period)
 
         dx_vals = []
         for i in range(len(atr_s)):
@@ -155,7 +156,7 @@ def compute_adx(candles, period=ADX_PERIOD):
             dx  = 100.0 * abs(pdi - mdi) / denom if denom else 0.0
             dx_vals.append((dx, pdi, mdi))
 
-        adx_s = wilder([d[0] for d in dx_vals], period)
+        adx_s = _wilder([d[0] for d in dx_vals], period)
         if not adx_s:
             return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
 
