@@ -759,27 +759,30 @@ def check_stops(positions, all_data, equity):
         elif adx_val < ADX_DECAY_EXIT:
             decay_hits = peak_data.get('adx_decay_count', 0)
             if decay_hits < 1:
+                # Bar 1: arm counter, fall through to chandelier — no exit yet.
                 peak_data['adx_decay_count'] = 1
                 peaks_changed = True
                 logger.warning(
                     f"📉 ADX DECLINING {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} "
                     f"— confirming next bar before exit"
                 )
-                # fall through to chandelier — don't skip stop protection during confirmation bar
-            logger.warning(
-                f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
-            )
-            send_telegram(
-                f"📉 <b>ADX DECAY EXIT {sym} {side}</b>\n"
-                f"ADX={adx_val:.1f} dropped below {ADX_DECAY_EXIT} — trend exhausted"
-            )
-            if close_position_market(sym, all_data, equity,
-                                     f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
-                peaks.pop(sym, None)
-                peaks_changed = True
-                closed_any = True
-                time.sleep(1)
-            continue
+            else:
+                # Bar 2: confirmed — close now.
+                logger.warning(
+                    f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
+                )
+                send_telegram(
+                    f"📉 <b>ADX DECAY EXIT {sym} {side}</b>\n"
+                    f"ADX={adx_val:.1f} dropped below {ADX_DECAY_EXIT} — trend exhausted"
+                )
+                if close_position_market(sym, all_data, equity,
+                                         f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
+                    peaks.pop(sym, None)
+                    peaks_changed = True
+                    closed_any = True
+                    time.sleep(1)
+                    continue  # position closed — chandelier has nothing to act on
+                # close failed — fall through to chandelier as backstop
         elif peak_data.get('adx_decay_count', 0):
             peak_data['adx_decay_count'] = 0
             peaks_changed = True
