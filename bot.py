@@ -1128,7 +1128,7 @@ def print_summary(equity, positions, all_data):
 
     pnl_emoji = "📈" if total_pnl >= 0 else "📉"
     send_telegram(
-        f"{pnl_emoji} <b>4h Cycle Summary</b>\n"
+        f"{pnl_emoji} <b>4h Summary</b>\n"
         f"Equity: ${equity:.2f}\n"
         f"Total P&L: {tsign}${total_pnl:.2f} ({tsign}{total_pnl_pct:.2f}%)\n"
         f"Realized: {rsign}${realized_pnl:.2f} | Unrealized: {usign}${unrealized_pnl:.2f}\n"
@@ -1244,10 +1244,6 @@ def run_bot():
                 entry_sym, is_long, pb_reason = select_entry(data_d, occupied)
                 if not entry_sym:
                     continue
-                try:
-                    log_advisor_verdict(entry_sym, is_long, pb_reason, all_data.get(entry_sym, {}))
-                except Exception as e:
-                    logger.warning(f"AI advisor hook failed (non-blocking): {e}")
                 # Open-position risk: full STOP_ATR_MULT×ATR even for BE-locked trades.
                 # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
                 # Prospective entry: +1 trade's worth so we can't step over the cap.
@@ -1262,6 +1258,11 @@ def run_bot():
                 if heat_pct >= cap_pct:
                     logger.info(f"[{d or 'std'}] heat {heat_pct*100:.1f}% ≥ {cap_pct*100:.0f}% cap — skipping {entry_sym}")
                     continue
+                # Advisory log AFTER the heat gate so blocked setups don't incur API cost
+                try:
+                    log_advisor_verdict(entry_sym, is_long, pb_reason, all_data.get(entry_sym, {}))
+                except Exception as e:
+                    logger.warning(f"AI advisor hook failed (non-blocking): {e}")
                 place_loc_order(entry_sym, is_long, all_data, eq_d, pb_reason)
 
             positions    = get_open_positions()
