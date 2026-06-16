@@ -24,7 +24,14 @@ from config import (
     VOLUME_CONFIRM_RATIO, STRUCT_STOP_BUFFER,
 )
 from notify import send_telegram
-from ai_advisor import log_advisor_verdict
+# Advisory-only logging — must never prevent the bot from starting. If the module
+# or its deps (anthropic SDK) are unavailable, fall back to a no-op.
+try:
+    from ai_advisor import log_advisor_verdict
+except Exception as _e:
+    logger.warning(f"ai_advisor unavailable — advisory logging disabled: {_e}")
+    def log_advisor_verdict(*args, **kwargs):
+        return None
 from signals import (
     compute_daily_vol, compute_atr,
     compute_funding, compute_supertrend, compute_adx, compute_rsi, compute_ema,
@@ -519,7 +526,7 @@ def check_pending_loc(positions, all_data, equity):
             if sym_data is None:
                 logger.warning(f"{symbol}: not in all_data this cycle — fetching individually for LOC finalization")
                 try:
-                    fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
+                    fallback_ctxs = meta_and_ctxs(dex_of(symbol))  # dex-correct ctxs so funding is right for xyz:
                 except Exception:
                     fallback_ctxs = None
                 sym_data = get_symbol_data(symbol, asset_ctxs=fallback_ctxs) or {}
@@ -685,7 +692,7 @@ def check_stops(positions, all_data, equity):
             logger.warning(f"Stop check: {sym} missing from market data — attempting individual fetch")
             send_telegram(f"⚠️ <b>{sym}: market data missing</b>\nStop checks skipped — retrying fetch individually")
             try:
-                fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
+                fallback_ctxs = meta_and_ctxs(dex_of(sym))  # dex-correct ctxs so funding is right for xyz:
             except Exception:
                 fallback_ctxs = None
             data = get_symbol_data(sym, asset_ctxs=fallback_ctxs)
@@ -706,21 +713,31 @@ def check_stops(positions, all_data, equity):
             peaks_changed = True
         peak_data = peaks[sym]
 
+        # Supertrend direction (used by both the funding-exit reason and the ST exit)
+        st = data.get('supertrend', {})
+        st_dir = st.get('direction', 'neutral')
+        st_against = (side == "LONG" and st_dir == "bearish") or \
+                     (side == "SHORT" and st_dir == "bullish")
+
         # ── 0. Funding exit — close if funding turns adverse while held ──────
+        # Order matches the backtest (funding before ST). When ST is ALSO against,
+        # note it in the reason so post-trade analysis isn't misled into attributing
+        # the exit purely to funding.
         funding = data.get('funding_data', {}).get('funding', 0.0)
         funding_against = (side == "LONG"  and funding >  FUNDING_EXIT_THRESHOLD) or \
                           (side == "SHORT" and funding < -FUNDING_EXIT_THRESHOLD)
         if funding_against:
+            also_st = " + ST against" if st_against else ""
             logger.warning(
                 f"💸 FUNDING EXIT {sym} {side}: funding {funding:.4f}% adverse "
-                f"(threshold ±{FUNDING_EXIT_THRESHOLD}%) — closing"
+                f"(threshold ±{FUNDING_EXIT_THRESHOLD}%){also_st} — closing"
             )
             send_telegram(
                 f"💸 <b>FUNDING EXIT {sym} {side}</b>\n"
-                f"Funding {funding:.4f}% turned adverse (±{FUNDING_EXIT_THRESHOLD}%) — market close"
+                f"Funding {funding:.4f}% turned adverse (±{FUNDING_EXIT_THRESHOLD}%){also_st} — market close"
             )
             if close_position_market(sym, all_data, equity,
-                                     f"Funding adverse ({funding:.4f}%)"):
+                                     f"Funding adverse ({funding:.4f}%){also_st}"):
                 peaks.pop(sym, None)
                 peaks_changed = True
                 closed_any = True
@@ -728,10 +745,6 @@ def check_stops(positions, all_data, equity):
             continue
 
         # ── 1. Supertrend exit — close whenever ST is against position ───────
-        st = data.get('supertrend', {})
-        st_dir = st.get('direction', 'neutral')
-        st_against = (side == "LONG" and st_dir == "bearish") or \
-                     (side == "SHORT" and st_dir == "bullish")
         if st_against:
             logger.warning(
                 f"🔄 ST EXIT {sym} {side}: Supertrend is {st_dir.upper()} — closing"
@@ -1115,7 +1128,7 @@ def print_summary(equity, positions, all_data):
 
     pnl_emoji = "📈" if total_pnl >= 0 else "📉"
     send_telegram(
-        f"{pnl_emoji} <b>Hourly Summary</b>\n"
+        f"{pnl_emoji} <b>4h Cycle Summary</b>\n"
         f"Equity: ${equity:.2f}\n"
         f"Total P&L: {tsign}${total_pnl:.2f} ({tsign}{total_pnl_pct:.2f}%)\n"
         f"Realized: {rsign}${realized_pnl:.2f} | Unrealized: {usign}${unrealized_pnl:.2f}\n"
@@ -1212,8 +1225,10 @@ def run_bot():
             # Each dex (standard "" / xyz HIP-3) is an isolated sub-portfolio with
             # its own equity, position cap, and heat cap.
             pending_syms = set(_load_pending_loc().keys())
-            peaks = _load_peaks()
             for d in DEXES:
+                # Reload peaks each iteration: an immediate LOC fill in a prior dex's
+                # iteration calls init_peak, so a once-before-the-loop load would be stale.
+                peaks = _load_peaks()
                 eq_d = equity_by_dex.get(d, 0.0)
                 if eq_d <= 0:
                     continue  # no collateral on this dex — can't size/enter (positions still managed by stops)
