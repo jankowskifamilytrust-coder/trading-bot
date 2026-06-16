@@ -3,6 +3,7 @@ import atexit
 import math
 import time
 import json
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -124,7 +125,7 @@ def build_volume_ranking():
 
     def fetch_30d(sym):
         try:
-            candles = mainnet_info.candles_snapshot(sym, "1d", start_ms, end_ms)
+            candles = _candles_with_backoff(sym, "1d", start_ms, end_ms)
             if not candles:
                 return sym, 0.0
             avg = sum(float(c['v']) * float(c['c']) for c in candles) / len(candles)
@@ -133,7 +134,7 @@ def build_volume_ranking():
             logger.warning(f"Volume rank: {sym} failed — {e}")
             return sym, 0.0
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(fetch_30d, sym): sym for sym, _ in candidates}
         results = [f.result() for f in as_completed(futures)]
 
@@ -179,6 +180,25 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
 
 # ─── Market Data ──────────────────────────────────────────────────────────────
 
+def _candles_with_backoff(symbol, interval, start_ms, end_ms, retries=5, base_pause=2.0):
+    """candles_snapshot with exponential backoff + jitter on HTTP 429 (CloudFront
+    rate-limit). Non-rate-limit errors are raised immediately. Jitter prevents
+    parallel threads from retrying in lockstep and re-bursting."""
+    for attempt in range(retries):
+        try:
+            return mainnet_info.candles_snapshot(symbol, interval, start_ms, end_ms)
+        except Exception as e:
+            if "429" in str(e) and attempt < retries - 1:
+                pause = base_pause * (2 ** attempt) + random.uniform(0, 1.0)
+                logger.warning(
+                    f"{symbol} {interval}: 429 rate-limited — backoff {pause:.1f}s "
+                    f"(attempt {attempt+1}/{retries})"
+                )
+                time.sleep(pause)
+                continue
+            raise
+
+
 def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=None):
     for attempt in range(1, max_retries + 1):
         try:
@@ -201,7 +221,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
             try:
                 d_end = int(time.time() * 1000)
                 d_start = d_end - (90 * 24 * 60 * 60 * 1000)
-                daily_candles = mainnet_info.candles_snapshot(symbol, "1d", d_start, d_end)
+                daily_candles = _candles_with_backoff(symbol, "1d", d_start, d_end)
                 if daily_candles:
                     try:
                         if d_end - int(daily_candles[-1]['t']) < 24 * 60 * 60 * 1000:
@@ -227,7 +247,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
             try:
                 h4_end = int(time.time() * 1000)
                 h4_start = h4_end - (30 * 24 * 60 * 60 * 1000)
-                candles_4h = mainnet_info.candles_snapshot(symbol, "4h", h4_start, h4_end)
+                candles_4h = _candles_with_backoff(symbol, "4h", h4_start, h4_end)
                 # Drop forming 4h bar — compute only on the most recent *closed* 4h bar
                 if candles_4h:
                     try:
@@ -289,7 +309,7 @@ def get_all_market_data(symbols, open_position_syms=None):
         logger.warning(f"Could not pre-fetch mid prices — will fetch per-symbol: {e}")
     all_data = {}
     failed = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:  # lowered to ease CloudFront rate limits
         futures = {
             executor.submit(get_symbol_data, sym, 3, 5, ctxs_by_dex.get(dex_of(sym)), mids): sym
             for sym in symbols
