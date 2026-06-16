@@ -598,15 +598,15 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
         logger.error(f"{symbol}: no book — cannot place LOC order")
         return False
 
-    # Snap to tick grid, then enforce Hyperliquid's ≤5 significant-figure rule.
-    # Rounding to the book's decimal count alone doesn't guarantee tick alignment
-    # or the sig-fig constraint, and either violation causes an order rejection.
-    snapped = round(ema_val / tick) * tick if tick > 0 else ema_val
-    if snapped > 0:
-        mag = int(math.log10(snapped)) + 1      # digits left of decimal point
-        limit_px = round(snapped, max(0, 5 - mag))
+    # Snap directionally to the maker side (floor for buys, ceil for sells) so the
+    # snap itself can't push the price through the book and trigger the crossing guard.
+    # Then enforce Hyperliquid's ≤5 significant-figure rule via Python's %g formatter,
+    # which handles sub-1 prices correctly (int(log10(x))+1 undercounts for x < 1).
+    if tick > 0:
+        snapped = (math.floor(ema_val / tick) if is_long else math.ceil(ema_val / tick)) * tick
     else:
-        limit_px = round(snapped, decimals)     # fallback for sub-cent prices
+        snapped = ema_val
+    limit_px = float(f"{snapped:.5g}") if snapped > 0 else round(snapped, decimals)
     # Defence-in-depth: C3 tightening makes crossing unreachable in normal flow,
     # but guard remains for any edge case that slips through.
     if is_long and limit_px > best_bid:
