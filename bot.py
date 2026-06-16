@@ -13,7 +13,7 @@ from config import (
     RISK_PER_TRADE_PCT, MAX_PORTFOLIO_RISK_PCT, MIN_NOTIONAL_USD, STOP_ATR_MULT,
     MAX_NOTIONAL_PCT, MIN_NOTIONAL_PCT,
     TRADE_LOG, EQUITY_LOG, TRAILING_STOP_LOG, LOC_LOG,
-    VOLUME_RANK_LOG, VOLUME_RANK_TTL_HOURS,
+    VOLUME_RANK_LOG, VOLUME_RANK_TTL_HOURS, START_EQUITY_LOG,
     SUPERTREND_PERIOD, SUPERTREND_MULT,
     ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD, RSI_LONG_THRESHOLD, RSI_SHORT_THRESHOLD, RSI_LOOKBACK,
@@ -157,15 +157,15 @@ def get_top_symbols(top_n=TOP_N, extra_symbols=None):
 
 # ─── Market Data ──────────────────────────────────────────────────────────────
 
-def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None):
+def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=None):
     for attempt in range(1, max_retries + 1):
         try:
-            mids = mainnet_info.all_mids()
-            if symbol not in mids:
+            _mids = mids if mids is not None else mainnet_info.all_mids()
+            if symbol not in _mids:
                 logger.warning(f"{symbol} not found on Hyperliquid")
                 return None
 
-            price = float(mids[symbol])
+            price = float(_mids[symbol])
             end_time = int(time.time() * 1000)
             start_time = end_time - (48 * 60 * 60 * 1000)
             candles = mainnet_info.candles_snapshot(symbol, "1h", start_time, end_time)
@@ -207,6 +207,12 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None):
                 d_end = int(time.time() * 1000)
                 d_start = d_end - (90 * 24 * 60 * 60 * 1000)
                 daily_candles = mainnet_info.candles_snapshot(symbol, "1d", d_start, d_end)
+                if daily_candles:
+                    try:
+                        if d_end - int(daily_candles[-1]['t']) < 24 * 60 * 60 * 1000:
+                            daily_candles = daily_candles[:-1]
+                    except (KeyError, TypeError):
+                        pass
                 supertrend = compute_supertrend(daily_candles)
                 adx = compute_adx(daily_candles)
             except Exception as e:
@@ -272,10 +278,15 @@ def get_all_market_data(symbols, open_position_syms=None):
         asset_ctxs = mainnet_info.meta_and_asset_ctxs()
     except Exception as e:
         logger.warning(f"Could not pre-fetch asset contexts — funding data unavailable this cycle: {e}")
+    mids = None
+    try:
+        mids = mainnet_info.all_mids()
+    except Exception as e:
+        logger.warning(f"Could not pre-fetch mid prices — will fetch per-symbol: {e}")
     all_data = {}
     failed = []
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(get_symbol_data, sym, 3, 5, asset_ctxs): sym for sym in symbols}
+        futures = {executor.submit(get_symbol_data, sym, 3, 5, asset_ctxs, mids): sym for sym in symbols}
         for future in as_completed(futures):
             sym = futures[future]
             try:
@@ -386,12 +397,21 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
         time.sleep(2)
     fill_px = pos['entry'] if pos else 0
     fill_sz = abs(pos['size']) if pos else 0
+
+    if not fill_px:
+        logger.warning(f"⚠️ OPEN {direction} {symbol}: position not found after retries — check exchange manually")
+        send_telegram(
+            f"⚠️ <b>{direction} {symbol}: fill not confirmed</b>\n"
+            f"Position not found after 3 retries — check exchange manually"
+        )
+        return False
+
     logger.success(f"✅ OPEN {direction} {symbol}: {fill_sz} @ ${fill_px:.4f} (MAKER) | "
                    f"Notional: ${notional_usd:.2f} | Confluence: {confluence}")
 
     # Compute structural stop from swing low/high over the RSI lookback window
     struct_stop = None
-    if sym_data and fill_px:
+    if sym_data:
         struct_atr = sym_data.get('atr')
         sw_low, sw_high = sym_data.get('struct_stops', (None, None))
         if struct_atr:
@@ -399,11 +419,9 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
                 struct_stop = sw_low - STRUCT_STOP_BUFFER * struct_atr
             elif not is_buy and sw_high and sw_high > fill_px:
                 struct_stop = sw_high + STRUCT_STOP_BUFFER * struct_atr
-    if fill_px:
-        init_peak(symbol, fill_px, struct_stop=struct_stop, atr_val=atr_val)
+    init_peak(symbol, fill_px, struct_stop=struct_stop, atr_val=atr_val)
     action_label = "BUY" if is_buy else "SELL"
-    log_trade(action_label, symbol, fill_sz, fill_px, reason, equity,
-              confluence)
+    log_trade(action_label, symbol, fill_sz, fill_px, reason, equity, confluence)
     emoji = "🟢" if is_buy else "🟠"
     stop_dist = f"${STOP_ATR_MULT * atr_val:.4f}" if atr_val else "n/a"
     dollar_risk = equity * RISK_PER_TRADE_PCT if equity else 0
@@ -577,7 +595,20 @@ def place_loc_order(symbol, is_long, all_data, equity):
         logger.error(f"{symbol}: no book — cannot place LOC order")
         return False
 
-    limit_px    = round(ema_val, decimals)
+    limit_px = round(ema_val, decimals)
+    # Post-only orders must rest on the maker side — skip if EMA would cross the book
+    if is_long and limit_px > best_bid:
+        logger.info(
+            f"{symbol} LONG LOC: EMA ${limit_px:.{decimals}f} > bid ${best_bid:.{decimals}f} "
+            f"— price below EMA, post-only would cross — skipping"
+        )
+        return False
+    if not is_long and limit_px < best_ask:
+        logger.info(
+            f"{symbol} SHORT LOC: EMA ${limit_px:.{decimals}f} < ask ${best_ask:.{decimals}f} "
+            f"— price above EMA, post-only would cross — skipping"
+        )
+        return False
     size_tokens = round(notional_usd / limit_px, sz_decimals)
     min_size    = 10 ** (-sz_decimals)
     if size_tokens < min_size:
@@ -610,7 +641,6 @@ def place_loc_order(symbol, is_long, all_data, equity):
             "atr_val":     atr_val,
             "confluence":  "7/7 LOC",
             "reason":      f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})",
-            "placed_at":   datetime.now().isoformat(),
         }
         _save_pending_loc(pending)
         logger.info(
@@ -631,15 +661,15 @@ def place_loc_order(symbol, is_long, all_data, equity):
 
 def check_stops(positions, all_data, equity):
     """
-    Four exit triggers, evaluated in order per position:
+    Three exit triggers, evaluated in order per position:
 
     1. Supertrend flip — daily ST flips against position direction → market close.
-    2. ADX decay — ADX drops below ADX_DECAY_EXIT → trend is dead, close.
-    3. Time exit — held > MAX_HOLD_HOURS without reaching break-even → close.
-    4. Chandelier trailing stop with break-even lock + structural floor.
-       stop = peak ± STOP_ATR_MULT × ATR; at break-even the peak is floored
-       so the stop never retreats below entry. The structural stop (swing
-       low/high ± STRUCT_STOP_BUFFER × ATR) acts as the minimum stop floor
+    2. ADX decay — 2 consecutive bars below ADX_DECAY_EXIT → trend is dead, close.
+    3. Chandelier trailing stop with break-even lock + structural floor.
+       stop = peak ± STOP_ATR_MULT × ATR; once the peak has moved STOP_ATR_MULT×entryATR
+       in our favour the stop is floored at entry (BE lock uses the stored entry ATR so
+       an ATR expansion cannot push the stop back below entry). The structural stop
+       (swing low/high ± STRUCT_STOP_BUFFER × ATR) acts as the minimum stop floor
        in the early part of the trade before the chandelier catches up.
     """
     peaks = _load_peaks()
@@ -717,7 +747,9 @@ def check_stops(positions, all_data, equity):
 
         peak          = peak_data["peak"]
         struct_stop   = peak_data.get("struct_stop")
+        entry_atr     = peak_data.get("atr") or atr
         stop_distance = STOP_ATR_MULT * atr
+        be_stop_dist  = STOP_ATR_MULT * entry_atr   # uses stored entry ATR so expansion can't break BE
 
         # ── 4. Chandelier stop + structural floor ─────────────────────────────
         if side == "LONG":
@@ -727,6 +759,9 @@ def check_stops(positions, all_data, equity):
             chandelier_stop = new_peak - stop_distance
             if struct_stop is not None and struct_stop < entry:
                 chandelier_stop = max(chandelier_stop, struct_stop)
+            be_active = new_peak >= entry + be_stop_dist
+            if be_active:
+                chandelier_stop = max(chandelier_stop, entry)
             stop_price = chandelier_stop
             breached   = price <= stop_price
         else:
@@ -736,6 +771,9 @@ def check_stops(positions, all_data, equity):
             chandelier_stop = new_peak + stop_distance
             if struct_stop is not None and struct_stop > entry:
                 chandelier_stop = min(chandelier_stop, struct_stop)
+            be_active = new_peak <= entry - be_stop_dist
+            if be_active:
+                chandelier_stop = min(chandelier_stop, entry)
             stop_price = chandelier_stop
             breached   = price >= stop_price
 
@@ -743,8 +781,6 @@ def check_stops(positions, all_data, equity):
             peaks[sym]["peak"] = new_peak
             peaks_changed = True
 
-        be_active  = (side == "LONG"  and new_peak >= entry + stop_distance) or \
-                     (side == "SHORT" and new_peak <= entry - stop_distance)
         be_tag     = " [BE]" if be_active else ""
         struct_tag = f" | struct=${struct_stop:.4f}" if struct_stop else ""
         logger.debug(
@@ -828,7 +864,10 @@ def select_entry(all_data, positions):
 
         passed, pb_reason = _check_pullback_entry(symbol, all_data, action)
         if not passed:
-            logger.debug(f"  {symbol} {action}: pullback not ready — {pb_reason}")
+            if data.get('ema_4h_slope') == 'unknown':
+                logger.info(f"  {symbol} {action}: C0 blocked — insufficient 4h history for slope")
+            else:
+                logger.debug(f"  {symbol} {action}: pullback not ready — {pb_reason}")
             continue
 
         logger.info(f"  {symbol} {action}: SETUP READY — ADX={adx_val:.1f} | {pb_reason}")
@@ -928,6 +967,8 @@ def log_trade(action, symbol, size, price, reason, equity, confluence=""):
         "confluence": confluence,
         "leverage": LEVERAGE, "notional": size * price
     })
+    if len(trades) > 10000:
+        trades = trades[-10000:]
     save_json(TRADE_LOG, trades)
 
 def log_equity(equity, all_data, positions):
@@ -958,7 +999,8 @@ def print_summary(equity, positions, all_data):
     if not curve:
         return
 
-    start_equity = curve[0]['equity']
+    start_data = load_json(START_EQUITY_LOG, None)
+    start_equity = start_data['equity'] if start_data else curve[0]['equity']
     real_trades = [t for t in trades if t['action'] in ['BUY', 'SELL']]
 
     unrealized_pnl = 0.0
@@ -1032,13 +1074,17 @@ def print_summary(equity, positions, all_data):
 
 def run_bot():
     lockfile = "/tmp/trading_bot.lock"
-    if os.path.exists(lockfile):
-        with open(lockfile) as _lf:
-            old_pid = _lf.read().strip()
+    try:
+        with open(lockfile, 'x') as _lf:
+            _lf.write(str(os.getpid()))
+    except FileExistsError:
+        try:
+            with open(lockfile) as _lf:
+                old_pid = _lf.read().strip()
+        except Exception:
+            old_pid = "unknown"
         logger.error(f"Lock file exists (PID {old_pid}) — another instance may be running. Exiting.")
         raise SystemExit(1)
-    with open(lockfile, 'w') as _lf:
-        _lf.write(str(os.getpid()))
     atexit.register(lambda: os.path.exists(lockfile) and os.remove(lockfile))
 
     logger.info("=== Claude Long/Short Orderflow Bot Started (MAKER orders) ===")
@@ -1052,6 +1098,11 @@ def run_bot():
 
     init_files()
     get_testnet_coins()
+    if not load_json(START_EQUITY_LOG, None):
+        first_eq = get_equity()
+        if first_eq > 0:
+            save_json(START_EQUITY_LOG, {"equity": first_eq, "recorded_at": datetime.now().isoformat()})
+            logger.info(f"Start equity recorded: ${first_eq:.2f}")
     send_telegram(
         "🤖 <b>Trading Bot Started</b>\n"
         f"Top {TOP_N} liquid perps | {LEVERAGE}x | Max {MAX_POSITIONS}\n"
@@ -1067,7 +1118,9 @@ def run_bot():
             positions = get_open_positions()
             symbols   = get_top_symbols(TOP_N, extra_symbols=list(positions.keys()))
             all_data  = get_all_market_data(symbols, open_position_syms=set(positions.keys()))
-            equity    = get_equity()
+            equity = get_equity()
+            if equity <= 0:
+                equity = get_equity()   # one retry on transient API failure
 
             logger.info(f"Equity: ${equity:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
 
