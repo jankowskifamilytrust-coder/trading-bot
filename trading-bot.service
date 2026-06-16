@@ -1,0 +1,16 @@
+[Unit]
+Description=Hyperliquid Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading-bot
+ExecStart=/root/trading-bot/venv/bin/python3 /root/trading-bot/bot.py
+EnvironmentFile=/root/trading-bot/.env
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
