@@ -250,11 +250,16 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
                 adx = compute_adx(daily_candles)
                 # C0: daily EMA slope (one timeframe up from the 4h entry trigger)
                 daily_slope = compute_ema_slope(daily_candles, period=EMA_PERIOD, lag=3)
+                # Timestamp of the closed daily bar these daily indicators are computed on.
+                # Used by the ADX-decay exit to confirm across *distinct* daily readings
+                # rather than re-counting the same reading on successive 4h cycles.
+                daily_bar_t = int(daily_candles[-1]['t']) if daily_candles else None
             except Exception as e:
                 logger.warning(f"{symbol}: daily candle fetch failed — Supertrend/ADX neutral: {e}")
                 supertrend = {"direction": "neutral", "value": 0.0, "changed": False}
                 adx = {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0, "trending": False}
                 daily_slope = "unknown"
+                daily_bar_t = None
 
             # 4h candles — entry-trigger timeframe (C2–C5), matches backtest
             candles_4h = []
@@ -290,6 +295,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
                 "funding_data": compute_funding(symbol, asset_ctxs),
                 "supertrend": supertrend,
                 "adx": adx,
+                "daily_bar_t": daily_bar_t,
                 "daily_slope": daily_slope,
                 "rsi_entry": rsi_entry,
                 "ema_entry": ema_entry,
@@ -365,12 +371,14 @@ def get_all_market_data(symbols, open_position_syms=None):
 
 def compute_notional(symbol, all_data, equity):
     """
-    ATR-based sizing: risk exactly RISK_PER_TRADE_PCT of equity per stop-out
-    (currently 2.5%). Returns (None, None) to signal skip — callers must handle this.
+    ATR-based sizing: size so that a stop at STOP_ATR_MULT×ATR loses ~RISK_PER_TRADE_PCT
+    of equity (currently ~2.5%). This is APPROXIMATE, not exact: the live stop is the
+    chandelier, and the structural-stop floor can make it TIGHTER than STOP_ATR_MULT×ATR,
+    so realized risk at the stop is typically ≤ RISK_PER_TRADE_PCT. Returns (None, None)
+    to signal skip — callers must handle this.
 
     Cap  : equity×MAX_NOTIONAL_PCT (currently 30%) — scales with account, no static ceiling.
-    Floor: max(equity×MIN_NOTIONAL_PCT, MIN_NOTIONAL_USD) — skip rather than inflate
-           (preserves the RISK_PER_TRADE_PCT risk budget instead of over-sizing).
+    Floor: max(equity×MIN_NOTIONAL_PCT, MIN_NOTIONAL_USD) — skip rather than inflate.
     """
     atr   = all_data[symbol].get('atr')
     price = all_data[symbol].get('tn_price') or all_data[symbol].get('price', 0)
@@ -951,13 +959,18 @@ def check_stops(positions, all_data, equity, trust_positions=True):
     Three exit triggers, evaluated in order per position:
 
     1. Supertrend flip — daily ST flips against position direction → market close.
-    2. ADX decay — 2 consecutive bars below ADX_DECAY_EXIT → trend is dead, close.
-    3. Chandelier trailing stop with break-even lock + structural floor.
-       stop = peak ± STOP_ATR_MULT × ATR; once the peak has moved STOP_ATR_MULT×entryATR
-       in our favour the stop is floored at entry (BE lock uses the stored entry ATR so
-       an ATR expansion cannot push the stop back below entry). The structural stop
-       (swing low/high ± STRUCT_STOP_BUFFER × ATR) acts as the minimum stop floor
-       in the early part of the trade before the chandelier catches up.
+    2. ADX decay — 2 consecutive DAILY ADX bars below ADX_DECAY_EXIT → trend dead, close.
+       ADX is computed on daily candles; the decay counter advances only on a NEW daily
+       bar (tracked via daily_bar_t), not on every 4h cycle.
+    3. Chandelier trailing stop with a break-even floor + structural floor.
+       Trailing stop = peak ∓ STOP_ATR_MULT × (current ATR).
+       Break-even: once price moves +1×(entry ATR) in our favour, the stop is floored at
+       entry. This is a NO-LOSS floor, not a profit-protecting trail — profit is protected
+       only by the chandelier once it trails past entry. While BE is active the peak is
+       anchored at entry ± STOP_ATR_MULT×(entry ATR), so it is a stop anchor, not a true
+       high-water mark. The floor uses the stored ENTRY ATR so a later ATR expansion can't
+       push the break-even stop back below entry. The structural stop (swing low/high ±
+       STRUCT_STOP_BUFFER × ATR) is a minimum floor early in the trade.
     """
     peaks = _load_peaks()
     peaks_changed = False
@@ -1079,45 +1092,58 @@ def check_stops(positions, all_data, equity, trust_positions=True):
                     time.sleep(1)
                 continue
 
-            # ── 2. ADX decay exit — requires 2 consecutive bars below threshold ──
+            # ── 2. ADX decay exit — requires 2 consecutive DAILY bars below threshold ──
+            # ADX is computed on daily candles but check_stops runs every 4h, so the same
+            # daily reading is seen ~6×/day. The decay counter must advance only on a NEW
+            # daily bar (tracked via daily_bar_t), otherwise the "2-bar confirmation"
+            # would confirm the same reading twice within a single day.
             adx_val = (data or {}).get('adx', {}).get('adx', 0.0)
+            bar_t   = (data or {}).get('daily_bar_t')
             if adx_val == 0.0:
                 # Sentinel value — compute_adx returned its failure default.
                 # Treat as missing data: skip (don't count, don't close) and reset any
                 # in-progress decay counter so stale bad data can't accumulate toward exit.
-                if peak_data.get('adx_decay_count', 0):
+                if peak_data.get('adx_decay_count', 0) or peak_data.get('decay_last_bar') is not None:
                     peak_data['adx_decay_count'] = 0
+                    peak_data['decay_last_bar'] = None
                     peaks_changed = True
                 logger.warning(f"Stop check: ADX=0 for {sym} (sentinel) — skipping decay check")
             elif adx_val < ADX_DECAY_EXIT:
-                decay_hits = peak_data.get('adx_decay_count', 0)
-                if decay_hits < 1:
-                    # Bar 1: arm counter, fall through to chandelier — no exit yet.
-                    peak_data['adx_decay_count'] = 1
-                    peaks_changed = True
-                    logger.warning(
-                        f"📉 ADX DECLINING {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} "
-                        f"— confirming next bar before exit"
-                    )
+                if bar_t is not None and bar_t == peak_data.get('decay_last_bar'):
+                    # Same daily ADX reading we already counted — don't re-confirm within
+                    # the same day. Hold the counter; the chandelier still runs below.
+                    logger.debug(f"ADX {sym}: still below on the same daily bar — holding decay count")
                 else:
-                    # Bar 2: confirmed — close now.
-                    logger.warning(
-                        f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
-                    )
-                    send_telegram(
-                        f"📉 <b>ADX DECAY EXIT {sym} {side}</b>\n"
-                        f"ADX={adx_val:.1f} dropped below {ADX_DECAY_EXIT} — trend exhausted"
-                    )
-                    if close_position_market(sym, all_data, equity,
-                                             f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
-                        cancel_exchange_stop(sym, peaks.pop(sym, None))
+                    peak_data['decay_last_bar'] = bar_t
+                    if peak_data.get('adx_decay_count', 0) < 1:
+                        # First daily bar below threshold: arm, no exit yet.
+                        peak_data['adx_decay_count'] = 1
                         peaks_changed = True
-                        closed_any = True
-                        time.sleep(1)
-                        continue  # position closed — chandelier has nothing to act on
-                    # close failed — fall through to chandelier as backstop
-            elif peak_data.get('adx_decay_count', 0):
+                        logger.warning(
+                            f"📉 ADX DECLINING {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} "
+                            f"— confirming next DAILY bar before exit"
+                        )
+                    else:
+                        # Second distinct daily bar below threshold — confirmed, close now.
+                        peaks_changed = True
+                        logger.warning(
+                            f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
+                        )
+                        send_telegram(
+                            f"📉 <b>ADX DECAY EXIT {sym} {side}</b>\n"
+                            f"ADX={adx_val:.1f} below {ADX_DECAY_EXIT} for a 2nd daily bar — trend exhausted"
+                        )
+                        if close_position_market(sym, all_data, equity,
+                                                 f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
+                            cancel_exchange_stop(sym, peaks.pop(sym, None))
+                            closed_any = True
+                            time.sleep(1)
+                            continue  # position closed — chandelier has nothing to act on
+                        # close failed — fall through to chandelier as backstop
+            elif peak_data.get('adx_decay_count', 0) or peak_data.get('decay_last_bar') is not None:
+                # ADX recovered above threshold — reset the decay sequence.
                 peak_data['adx_decay_count'] = 0
+                peak_data['decay_last_bar'] = None
                 peaks_changed = True
 
             peak          = peak_data["peak"]
@@ -1130,10 +1156,12 @@ def check_stops(positions, all_data, equity, trust_positions=True):
             if side == "LONG":
                 new_peak = max(peak, price)
                 if price - entry >= entry_atr:
-                    # Floor peak at the BE anchor using entry ATR for the threshold so both
-                    # the trigger and the activation check use the same distance. Note: stored
-                    # peak may exceed the actual price high-water-mark while BE is active —
-                    # it is a stop anchor, not a true MFE tracker.
+                    # Break-even lock: once price is at least 1×(entry ATR) in profit, anchor
+                    # the peak at entry + STOP_ATR_MULT×(entry ATR); combined with the stop
+                    # subtraction below, this floors the stop at entry — a no-loss lock, not a
+                    # profit trail. (Note: activation is at 1×ATR while the anchor distance
+                    # is STOP_ATR_MULT×ATR — different magnitudes.) The anchor can exceed the
+                    # real high-water mark; it is a stop anchor, not an MFE tracker.
                     new_peak = max(new_peak, entry + be_stop_dist)
                 chandelier_stop = new_peak - stop_distance
                 if struct_stop is not None and struct_stop < entry:

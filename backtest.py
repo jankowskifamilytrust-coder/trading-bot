@@ -245,6 +245,7 @@ def get_signals(sym, bar_t, daily, h4):
         "slope": daily_slope,
         "rsi": rsi, "ema": ema,
         "vol_ratio": vol_ratio,
+        "daily_bar_t": int(d_win[-1]['t']),   # for daily-bar-gated ADX-decay confirmation
     }
 
 
@@ -372,7 +373,7 @@ def run(symbols, daily, h4, funding=None):
                 positions[sym] = {
                     "side": side, "entry_px": fill_px, "size": size,
                     "entry_atr": loc['atr'], "peak": fill_px,
-                    "adx_decay_count": 0, "entry_t": bar_t,
+                    "adx_decay_count": 0, "decay_last_bar": None, "entry_t": bar_t,
                     "last_funding_t": bar_t,
                 }
                 trades.append({
@@ -398,6 +399,7 @@ def run(symbols, daily, h4, funding=None):
             entry_atr = pos["entry_atr"] or atr
             adx_val   = sig["adx"].get("adx", 0.0)
             st_dir    = sig["st"].get("direction", "neutral")
+            bar_day_t = sig.get("daily_bar_t")
 
             if funding is not None:
                 rate_sum = _funding_window_sum(funding_times, funding_rates, sym, pos["last_funding_t"], bar_t)
@@ -436,18 +438,27 @@ def run(symbols, daily, h4, funding=None):
                 close_pos(f"ST flip {st_dir}")
                 continue
 
-            # 2. ADX decay (2-bar confirmation)
+            # 2. ADX decay — 2 consecutive DAILY bars below threshold. ADX is daily but the
+            #    loop steps every 4h, so the counter must advance only on a NEW daily bar
+            #    (daily_bar_t), matching the live bot — otherwise it confirms the same daily
+            #    reading twice within one day.
             if adx_val == 0.0:
                 pos["adx_decay_count"] = 0  # sentinel — reset
+                pos["decay_last_bar"] = None
             elif adx_val < ADX_DECAY_EXIT:
-                if pos["adx_decay_count"] >= 1:
-                    close_pos(f"ADX decay {adx_val:.1f}<{ADX_DECAY_EXIT}")
-                    continue
+                if bar_day_t is not None and bar_day_t == pos.get("decay_last_bar"):
+                    pass  # same daily ADX reading already counted — hold
                 else:
-                    pos["adx_decay_count"] = 1
-                    # fall through to chandelier (bar 1 confirmation — don't exit yet)
+                    pos["decay_last_bar"] = bar_day_t
+                    if pos["adx_decay_count"] >= 1:
+                        close_pos(f"ADX decay {adx_val:.1f}<{ADX_DECAY_EXIT}")
+                        continue
+                    else:
+                        pos["adx_decay_count"] = 1
+                        # fall through to chandelier (daily bar 1 — don't exit yet)
             else:
                 pos["adx_decay_count"] = 0
+                pos["decay_last_bar"] = None
 
             # 3. Chandelier stop
             stop_dist   = STOP_ATR_MULT * atr
