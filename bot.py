@@ -42,6 +42,7 @@ from exchange import (
     mainnet_info, exchange as hl_exchange,
     get_all_mids, get_book,
     place_alo_limit, cancel_order, get_open_positions, get_equity,
+    last_known_positions, get_open_orders,
 )
 
 load_dotenv()
@@ -386,7 +387,8 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
                    confluence, reason, equity, sym_data=None):
     pos = None
     for _ in range(3):
-        pos = get_open_positions().get(symbol)
+        snapshot = get_open_positions()
+        pos = snapshot.get(symbol) if snapshot is not None else None
         if pos:
             break
         time.sleep(2)
@@ -436,7 +438,8 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
 def close_position_market(symbol, all_data, equity, reason, confluence=""):
     """Guaranteed-fill market close. Used for all automatic exits."""
     exec_price = all_data.get(symbol, {}).get('tn_price') or all_data.get(symbol, {}).get('price', 0)
-    pre_size = abs((get_open_positions().get(symbol) or {}).get('size', 0))
+    pre_snapshot = get_open_positions()
+    pre_size = abs(((pre_snapshot or {}).get(symbol) or {}).get('size', 0))
     try:
         if exec_price:
             result = hl_exchange.market_close(symbol, None, exec_price, SLIPPAGE)
@@ -450,12 +453,21 @@ def close_position_market(symbol, all_data, equity, reason, confluence=""):
         for s in statuses:
             if 'filled' in s:
                 fill_px = float(s['filled'].get('avgPx', exec_price))
-        if filled or symbol not in get_open_positions():
+        # Confirm the close: an explicit fill, OR a FRESH position read that no longer
+        # shows the symbol. A failed read (None) must NOT be treated as "gone" — that
+        # would log a phantom close and abandon a position that is still open.
+        post = get_open_positions()
+        gone = post is not None and symbol not in post
+        if filled or gone:
             logger.success(f"✅ CLOSE {symbol} @ ${fill_px:.4f} (market)")
             log_trade("CLOSE", symbol, pre_size, fill_px, reason, equity,
                       confluence)
             send_telegram(f"🔴 <b>CLOSE</b> (market)\nSymbol: <b>{symbol}</b>\nPrice: ${fill_px:.4f}\nReason: {reason}")
             return True
+        if post is None and not filled:
+            logger.error(f"❌ CLOSE {symbol} UNCONFIRMED: position read failed and no fill in response — treating as NOT closed")
+            send_telegram(f"⚠️ <b>Close {symbol} UNCONFIRMED</b>\nFill not in response and position read failed — will retry")
+            return False
         logger.error(f"❌ CLOSE {symbol} REJECTED: {err}")
         send_telegram(f"⚠️ <b>Close {symbol} REJECTED</b>\n{err}")
         return False
@@ -511,6 +523,71 @@ def _load_pending_loc():
 def _save_pending_loc(pending):
     save_json(LOC_LOG, pending)
 
+def _match_resting_order(orders, symbol, is_long, limit_px):
+    """Return the oid of a resting order in `orders` matching `symbol`/side/price, else None."""
+    if not orders:
+        return None
+    want_side = 'B' if is_long else 'A'   # Hyperliquid: B=bid/buy, A=ask/sell
+    for o in orders:
+        if o.get('coin') != symbol:
+            continue
+        if o.get('side') and o.get('side') != want_side:
+            continue
+        try:
+            if abs(float(o.get('limitPx', 0)) - limit_px) <= max(limit_px * 1e-4, 1e-9):
+                return o.get('oid')
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def reconcile_open_orders():
+    """Startup reconciliation of exchange resting orders against pending_loc records.
+
+    Closes the crash-between-place-and-record gap (Theme 2) and sweeps orphans:
+    - A 'placing' record with no oid that matches a live resting order → adopt it.
+    - A live resting order NOT tracked in pending_loc → cancel it (the bot only ever
+      places tracked LOC orders, so an untracked one is an orphan that could fill
+      into an unmanaged / duplicate position).
+    - A 'placing' record with no matching live order → the order never rested; drop it.
+    """
+    orders = get_open_orders()
+    if orders is None:
+        logger.warning("Startup reconciliation skipped — open-orders read failed")
+        return
+    pending = _load_pending_loc()
+    changed = False
+
+    by_symbol = {}
+    for o in orders:
+        by_symbol.setdefault(o.get('coin'), []).append(o)
+
+    # 1. Adopt resting orders for placing-intents missing their oid
+    for sym, meta in pending.items():
+        if meta.get('oid') is None and by_symbol.get(sym):
+            meta['oid'] = by_symbol[sym][0].get('oid')
+            meta['status'] = 'resting'
+            changed = True
+            logger.warning(f"Reconcile: adopted resting order for {sym} (oid {meta['oid']})")
+
+    # 2. Cancel any live resting order not tracked in pending_loc
+    tracked_oids = {m.get('oid') for m in pending.values() if m.get('oid') is not None}
+    for sym, olist in by_symbol.items():
+        for o in olist:
+            if o.get('oid') not in tracked_oids:
+                logger.warning(f"Reconcile: cancelling untracked resting order on {sym} (oid {o.get('oid')})")
+                send_telegram(f"♻️ <b>Reconcile</b>: cancelling untracked resting order on {sym} (oid {o.get('oid')})")
+                cancel_order(sym, o.get('oid'))
+
+    # 3. Drop placing-intents that never produced a resting order
+    for sym in list(pending.keys()):
+        if pending[sym].get('oid') is None:
+            logger.warning(f"Reconcile: dropping stale placing intent for {sym} — no resting order found")
+            del pending[sym]
+            changed = True
+
+    if changed:
+        _save_pending_loc(pending)
+
 def check_pending_loc(positions, all_data, equity):
     """
     Called at the start of each cycle. For each pending LOC order:
@@ -550,12 +627,28 @@ def check_pending_loc(positions, all_data, equity):
             continue
 
         # Not in the cycle-start snapshot. Re-check live state: the order may have
-        # filled after that snapshot was taken but before we got here.
-        live = get_open_positions()
+        # filled after that snapshot was taken but before we got here. A failed read
+        # (None → {}) means we can't confirm a fill, so we won't finalize — the safe
+        # direction (we fall through to the cancel attempt / keep-pending path).
+        live = get_open_positions() or {}
         if symbol in live and live[symbol]['side'] == direction:
             logger.info(f"{symbol} LOC {direction} filled just before resolution — finalizing")
             _finalize()
             continue
+
+        # A kept 'placing' intent (oid=None, from a place-time double API failure) —
+        # resolve its oid from live orders so we can cancel it instead of waiting for
+        # a restart. If the order genuinely never rested, drop the stale intent.
+        if oid is None:
+            orders = get_open_orders()
+            if orders is None:
+                logger.warning(f"{symbol}: placing intent unresolved (open-orders read failed) — keeping for next cycle")
+                continue
+            oid = _match_resting_order(orders, symbol, meta['is_buy'], meta['limit_px'])
+            if oid is None:
+                logger.warning(f"{symbol}: placing intent has no live resting order — dropping stale intent")
+                to_remove.append(symbol)
+                continue
 
         logger.info(f"{symbol} LOC {direction} unfilled at bar close — cancelling (oid {oid})")
         if cancel_order(symbol, oid):
@@ -565,7 +658,7 @@ def check_pending_loc(positions, all_data, equity):
             # Cancel not acknowledged — the order may still be resting. Don't drop
             # the record blindly: re-check for a fill, finalize if open, else keep
             # the pending record and retry the cancel next cycle.
-            live = get_open_positions()
+            live = get_open_positions() or {}
             if symbol in live and live[symbol]['side'] == direction:
                 logger.info(f"{symbol}: cancel failed but position is now open — finalizing")
                 _finalize()
@@ -653,9 +746,36 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     )
 
     reason = f"LOC at EMA ${limit_px:.4f} (ADX={adx_val:.1f})"
+
+    def _record(oid_val, status_val):
+        pending = _load_pending_loc()
+        pending[symbol] = {
+            "oid":          oid_val,
+            "is_buy":       is_long,
+            "limit_px":     limit_px,
+            "notional_usd": notional_usd,
+            "atr_val":      atr_val,
+            "confluence":   confluence,
+            "reason":       reason,
+            "status":       status_val,
+        }
+        _save_pending_loc(pending)
+
+    def _forget():
+        pending = _load_pending_loc()
+        if pending.pop(symbol, None) is not None:
+            _save_pending_loc(pending)
+
+    # Persist a "placing" intent BEFORE hitting the exchange. If the process dies
+    # between the order landing and recording its oid, startup reconciliation
+    # (reconcile_open_orders) can still find and cancel/adopt the resting order
+    # rather than leaving an untracked order that could fill into a second position.
+    _record(None, "placing")
+
     status, oid, fpx, fsz, err = place_alo_limit(symbol, is_long, size_tokens, limit_px)
 
     if status == 'filled':
+        _forget()  # position is open; _finalize_open owns tracking from here
         logger.success(f"{symbol} LOC filled immediately at ${fpx:.4f}")
         return _finalize_open(
             symbol, direction, is_long, notional_usd, atr_val,
@@ -665,17 +785,7 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
         )
 
     if status == 'resting':
-        pending = _load_pending_loc()
-        pending[symbol] = {
-            "oid":         oid,
-            "is_buy":      is_long,
-            "limit_px":    limit_px,
-            "notional_usd": notional_usd,
-            "atr_val":     atr_val,
-            "confluence":  confluence,
-            "reason":      reason,
-        }
-        _save_pending_loc(pending)
+        _record(oid, "resting")
         logger.info(
             f"{symbol} {direction} LOC resting @ ${limit_px:.{decimals}f} (oid {oid}) — "
             f"will cancel if unfilled next cycle"
@@ -687,6 +797,25 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
         )
         return True
 
+    # Error/unknown: the request may have failed OR the order may have rested and we
+    # lost the response. Query live open orders before giving up.
+    orders = get_open_orders()
+    if orders is None:
+        # Open-orders read ALSO failed — we cannot confirm whether the order rested.
+        # KEEP the 'placing' record (don't _forget) so the next startup reconcile can
+        # adopt or cancel it. Dropping it here would orphan a possibly-live resting order.
+        logger.warning(f"{symbol} LOC {direction}: '{status}' from API and open-orders read failed — keeping placing intent for reconcile")
+        send_telegram(f"⚠️ <b>{symbol} {direction} LOC uncertain</b>\nAPI '{status}' and order state unknown — kept for startup reconcile")
+        return False
+    adopted = _match_resting_order(orders, symbol, is_long, limit_px)
+    if adopted is not None:
+        _record(adopted, "resting")
+        logger.warning(f"{symbol} LOC {direction}: '{status}' from API but a matching resting order exists (oid {adopted}) — adopted")
+        send_telegram(f"⏳ <b>{symbol} {direction} LOC adopted</b>\nAPI returned '{status}' but order is resting (oid {adopted})")
+        return True
+
+    # Read succeeded and no matching order exists → the order genuinely did not rest.
+    _forget()
     logger.warning(f"{symbol} LOC {direction} could not rest: {status} — {err}")
     send_telegram(f"⚠️ <b>{symbol} {direction} LOC failed to rest</b>\n{status}: {err[:200]}")
     return False
@@ -708,27 +837,53 @@ def check_stops(positions, all_data, equity):
     peaks = _load_peaks()
     peaks_changed = False
     closed_any = False
+    mids = None   # lazy-loaded only if a degraded-mode price fallback is needed
 
     for sym, p in list(positions.items()):
         data = all_data.get(sym)
         if not data:
             logger.warning(f"Stop check: {sym} missing from market data — attempting individual fetch")
-            send_telegram(f"⚠️ <b>{sym}: market data missing</b>\nStop checks skipped — retrying fetch individually")
             try:
                 fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
             except Exception:
                 fallback_ctxs = None
             data = get_symbol_data(sym, asset_ctxs=fallback_ctxs)
-            if not data:
-                logger.error(f"Stop check: fallback fetch failed for {sym} — position unmanaged this cycle")
-                continue
-            all_data[sym] = data
-        atr   = data.get('atr')
-        price = data.get('tn_price') or data.get('price')
+            if data:
+                all_data[sym] = data
         entry = p['entry']
         side  = p['side']
+        atr   = data.get('atr') if data else None
+        price = (data.get('tn_price') or data.get('price')) if data else None
+
+        # Degraded mode: market data and/or ATR unavailable. NEVER leave a held position
+        # unmanaged — fall back to the last mid price + the stored entry ATR so the
+        # chandelier can still fire. ST/funding/ADX exits are skipped (no data), but the
+        # chandelier is the actual stop-loss and only needs current price + stored ATR.
+        degraded = False
+        used_mid = False
         if not atr or not price or not entry:
-            continue
+            stored = peaks.get(sym, {})
+            if not price:
+                if mids is None:
+                    try:
+                        mids = get_all_mids() or {}
+                    except Exception:
+                        mids = {}
+                try:
+                    price = float(mids.get(sym)) if mids.get(sym) else None
+                    used_mid = price is not None
+                except (TypeError, ValueError):
+                    price = None
+            if not atr:
+                atr = stored.get('atr')
+            if not price or not atr or not entry:
+                logger.error(f"Stop check: {sym} has no usable price/ATR even degraded — stop NOT evaluated this cycle")
+                send_telegram(f"⚠️ <b>CRITICAL: {sym} unmanaged</b>\nNo price/ATR available — stop NOT evaluated this cycle")
+                continue
+            degraded = True
+            px_src = "mid" if used_mid else "data"
+            logger.warning(f"Stop check {sym} {side}: DEGRADED — chandelier only (price from {px_src} ${price:.4f}, stored ATR {atr})")
+            send_telegram(f"⚠️ <b>{sym}: market data degraded</b>\nChandelier only — price from {px_src}, stored ATR (ST/funding/ADX exits skipped)")
 
         # Ensure peak entry exists before exit checks (ADX counter needs it)
         if sym not in peaks:
@@ -736,8 +891,10 @@ def check_stops(positions, all_data, equity):
             peaks_changed = True
         peak_data = peaks[sym]
 
-        # Supertrend direction (used by both the funding-exit reason and the ST exit)
-        st = data.get('supertrend', {})
+        # Supertrend direction (used by both the funding-exit reason and the ST exit).
+        # In degraded mode `data` is None → neutral defaults → ST/funding/ADX exits
+        # no-op and only the chandelier (below) runs.
+        st = (data or {}).get('supertrend', {})
         st_dir = st.get('direction', 'neutral')
         st_against = (side == "LONG" and st_dir == "bearish") or \
                      (side == "SHORT" and st_dir == "bullish")
@@ -746,7 +903,7 @@ def check_stops(positions, all_data, equity):
         # Order matches the backtest (funding before ST). When ST is ALSO against,
         # note it in the reason so post-trade analysis isn't misled into attributing
         # the exit purely to funding.
-        funding = data.get('funding_data', {}).get('funding', 0.0)
+        funding = (data or {}).get('funding_data', {}).get('funding', 0.0)
         funding_against = (side == "LONG"  and funding >  FUNDING_EXIT_THRESHOLD) or \
                           (side == "SHORT" and funding < -FUNDING_EXIT_THRESHOLD)
         if funding_against:
@@ -785,7 +942,7 @@ def check_stops(positions, all_data, equity):
             continue
 
         # ── 2. ADX decay exit — requires 2 consecutive bars below threshold ──
-        adx_val = data.get('adx', {}).get('adx', 0.0)
+        adx_val = (data or {}).get('adx', {}).get('adx', 0.0)
         if adx_val == 0.0:
             # Sentinel value — compute_adx returned its failure default.
             # Treat as missing data: skip (don't count, don't close) and reset any
@@ -865,11 +1022,12 @@ def check_stops(positions, all_data, equity):
             peaks[sym]["peak"] = new_peak
             peaks_changed = True
 
-        be_tag     = " [BE]" if be_active else ""
-        struct_tag = f" | struct=${struct_stop:.4f}" if struct_stop else ""
+        be_tag       = " [BE]" if be_active else ""
+        struct_tag   = f" | struct=${struct_stop:.4f}" if struct_stop else ""
+        degraded_tag = " [DEGRADED]" if degraded else ""
         logger.debug(
             f"Chandelier {sym} {side}: entry=${entry:.4f} peak=${new_peak:.4f} "
-            f"stop=${stop_price:.4f}{be_tag}{struct_tag} | now=${price:.4f}"
+            f"stop=${stop_price:.4f}{be_tag}{struct_tag}{degraded_tag} | now=${price:.4f}"
         )
 
         if breached:
@@ -1202,9 +1360,12 @@ def run_bot():
     logger.info(f"Trading: MAINNET | Interval: {INTERVAL_MINUTES}min ({INTERVAL_MINUTES//60}h, UTC-aligned)")
 
     init_files()
+    # Reconcile exchange resting orders against tracked state before trading, so a
+    # crash between order placement and persistence can't leave an orphaned order.
+    reconcile_open_orders()
     if not load_json(START_EQUITY_LOG, None):
         first_eq = get_equity()
-        if first_eq > 0:
+        if first_eq and first_eq > 0:
             save_json(START_EQUITY_LOG, {"equity": first_eq, "recorded_at": datetime.now().isoformat()})
             logger.info(f"Start equity recorded: ${first_eq:.2f}")
     send_telegram(
@@ -1219,33 +1380,65 @@ def run_bot():
         try:
             logger.info("--- New cycle ---")
 
+            # Fail closed: a failed position read returns None (not stale/empty data).
+            # If we have a last-known snapshot, run stops on it in DEGRADED mode but
+            # block new entries; if we've never read positions, skip the cycle.
             positions = get_open_positions()
+            positions_stale = False
+            if positions is None:
+                stale = last_known_positions()
+                if stale is None:
+                    logger.error("Position read failed and no last-known state — skipping cycle")
+                    send_telegram("⚠️ <b>CRITICAL: position read failed</b>\nNo known state — cycle skipped, retrying next bar")
+                    sleep_until_next_hour()
+                    continue
+                logger.error(f"Position read failed — DEGRADED: running stops on last-known {len(stale)} positions, entries blocked")
+                send_telegram("⚠️ <b>Position read failed (DEGRADED)</b>\nRunning stops on last-known state; new entries blocked this cycle")
+                positions = stale
+                positions_stale = True
+
             symbols   = get_top_symbols(TOP_N, extra_symbols=list(positions.keys()))
             all_data  = get_all_market_data(symbols, open_position_syms=set(positions.keys()))
             equity = get_equity()
-            if equity <= 0:
-                equity = get_equity()   # one retry on transient API failure
+            if equity is None or equity <= 0:
+                retry = get_equity()   # one retry on transient API failure
+                equity = retry if retry is not None else equity
+            equity_ok = equity is not None and equity > 0
+            eq_display = equity if equity is not None else 0.0
 
-            logger.info(f"Equity: ${equity:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
+            logger.info(f"Equity: ${eq_display:.2f} | Open positions: {len(positions)}/{MAX_POSITIONS}")
 
             # ── Step 0: Resolve pending LOC orders from last cycle ─────────────
-            positions = get_open_positions()   # refresh — LOC may have filled during market data fetch
-            check_pending_loc(positions, all_data, equity)
+            if not positions_stale:
+                refreshed = get_open_positions()   # refresh — LOC may have filled during market data fetch
+                if refreshed is not None:
+                    positions = refreshed
+            check_pending_loc(positions, all_data, eq_display)
 
-            if equity > 0:
-                log_equity(equity, all_data, positions)
+            if equity_ok:
+                log_equity(eq_display, all_data, positions)
 
             # ── Step 1: Automatic stops ────────────────────────────────────────
             if positions:
-                stopped = check_stops(positions, all_data, equity)
+                stopped = check_stops(positions, all_data, eq_display)
                 if stopped:
                     time.sleep(SETTLE_SECONDS)
-                    positions = get_open_positions()
-            equity = get_equity()  # refresh before entry decision
+                    refreshed = get_open_positions()
+                    if refreshed is not None:
+                        positions = refreshed   # keep last-known if the read fails
+            eq2 = get_equity()  # refresh before entry decision
+            if eq2 is not None:
+                equity = eq2
+                equity_ok = equity > 0
+                eq_display = equity
 
             # ── Step 2: LOC entry (only if slot available, no pending order, heat OK)
             pending_syms = set(_load_pending_loc().keys())
-            if len(pending_syms) + len(positions) < MAX_POSITIONS:
+            if positions_stale:
+                logger.warning("Position state is stale (degraded) — skipping entry scan this cycle")
+            elif not equity_ok:
+                logger.warning("Equity unknown/zero — skipping entry scan this cycle")
+            elif len(pending_syms) + len(positions) < MAX_POSITIONS:
                 logger.info("Scanning for entry setups...")
                 # Treat pending symbols as taken slots so select_entry skips them
                 occupied = {**positions, **{sym: {"side": "PENDING"} for sym in pending_syms}}
@@ -1278,9 +1471,13 @@ def run_bot():
                             logger.warning(f"AI advisor hook failed (non-blocking): {e}")
                         place_loc_order(entry_sym, is_long, all_data, equity, pb_reason)
 
-            positions = get_open_positions()
-            equity    = get_equity()
-            print_summary(equity, positions, all_data)
+            final_positions = get_open_positions()
+            if final_positions is not None:
+                positions = final_positions
+            final_eq = get_equity()
+            if final_eq is not None:
+                eq_display = final_eq
+            print_summary(eq_display, positions, all_data)
 
             sleep_until_next_hour()
 

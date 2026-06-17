@@ -98,10 +98,17 @@ def cancel_order(symbol, oid):
 
 
 _last_positions: dict = {}
+_positions_loaded = False
 
 def get_open_positions():
-    """All open positions, flat dict keyed by symbol."""
-    global _last_positions
+    """All open positions, flat dict keyed by symbol.
+
+    Returns None on API failure — NOT stale data — so callers can fail closed
+    (a silent stale/empty result is indistinguishable from a genuinely flat
+    account and can leave a live position unmanaged or fabricate a phantom one).
+    Use last_known_positions() explicitly for a degraded-mode fallback.
+    """
+    global _last_positions, _positions_loaded
     positions = {}
     try:
         state = mainnet_info.user_state(master)
@@ -116,14 +123,37 @@ def get_open_positions():
                     "side": "LONG" if size > 0 else "SHORT",
                 }
         _last_positions = positions
+        _positions_loaded = True
         return positions
     except Exception as e:
-        logger.error(f"Position check error: {e} — returning last known positions")
-        return _last_positions
+        logger.error(f"Position check error: {e} — read FAILED (returning None)")
+        return None
+
+
+def last_known_positions():
+    """Most recent successfully-read positions, or None if never read this run.
+
+    For degraded-mode (API-down) stop evaluation only — the data may be stale.
+    """
+    return _last_positions if _positions_loaded else None
+
+
+def get_open_orders():
+    """Live resting orders for the master account, or None on API failure."""
+    try:
+        return mainnet_info.open_orders(master)
+    except Exception as e:
+        logger.warning(f"Open-orders fetch failed: {e}")
+        return None
 
 
 def get_equity():
-    """Account value — spot USDC balance (unified account mode)."""
+    """Account value — spot USDC balance (unified account mode).
+
+    Returns None on API failure so callers can distinguish 'read failed' from a
+    genuine zero balance and fail closed (e.g. keep the portfolio-heat gate from
+    silently disabling itself when equity reads as 0 on a transient error).
+    """
     try:
         spot = mainnet_info.spot_user_state(master)
         for b in spot.get('balances', []):
@@ -132,4 +162,4 @@ def get_equity():
         return 0.0
     except Exception as e:
         logger.error(f"Equity read error: {e}")
-        return 0.0
+        return None
