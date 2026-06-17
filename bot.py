@@ -41,7 +41,7 @@ from signals import (
 from exchange import (
     mainnet_info, exchange as hl_exchange,
     get_all_mids, get_book,
-    place_alo_limit, cancel_order, get_open_positions, get_equity,
+    place_alo_limit, place_stop_market, cancel_order, get_open_positions, get_equity,
     last_known_positions, get_open_orders,
 )
 
@@ -52,7 +52,27 @@ load_dotenv()
 def load_json(filepath, default):
     try:
         with open(filepath, "r") as f:
-            return json.load(f)
+            content = f.read()
+        if not content.strip():
+            return default   # empty file == no state; not corruption
+        return json.loads(content)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as e:
+        # A non-empty file that won't parse is corrupt. Don't silently return the
+        # default — that would let the next save_json overwrite (and destroy) the
+        # only copy. Preserve it as .corrupt and alert so it can be recovered.
+        try:
+            corrupt = filepath + ".corrupt"
+            os.replace(filepath, corrupt)
+            logger.error(f"Corrupt JSON in {filepath}: {e} — preserved as {corrupt}, using default")
+        except Exception as mv_err:
+            logger.error(f"Corrupt JSON in {filepath}: {e} — could not preserve ({mv_err}), using default")
+        try:
+            send_telegram(f"⚠️ <b>Corrupt state file</b>\n{filepath} would not parse — preserved as .corrupt, using default")
+        except Exception:
+            pass
+        return default
     except Exception:
         return default
 
@@ -204,11 +224,15 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
 
             price = float(_mids[symbol])
 
-            # szDecimals via the SDK's loaded asset map
+            # szDecimals via the SDK's loaded asset map. Don't guess on failure — a
+            # wrong szDecimals guarantees an order reject (too many decimals) or a
+            # silent mis-size. Leave it None; place_loc_order skips ENTRY for this
+            # symbol (stops don't need szDecimals, so held positions are unaffected).
             try:
                 sz_decimals = mainnet_info.asset_to_sz_decimals[mainnet_info.name_to_asset(symbol)]
-            except Exception:
-                sz_decimals = 3
+            except Exception as e:
+                logger.warning(f"{symbol}: szDecimals lookup failed ({e}) — entries disabled this cycle")
+                sz_decimals = None
 
             # Daily candles — shared by Supertrend, ADX, and ATR sizing
             daily_candles = None
@@ -341,11 +365,12 @@ def get_all_market_data(symbols, open_position_syms=None):
 
 def compute_notional(symbol, all_data, equity):
     """
-    ATR-based sizing: risk exactly RISK_PER_TRADE_PCT of equity per stop-out.
-    Returns (None, None) to signal skip — callers must handle this.
+    ATR-based sizing: risk exactly RISK_PER_TRADE_PCT of equity per stop-out
+    (currently 2.5%). Returns (None, None) to signal skip — callers must handle this.
 
-    Cap  : equity×MAX_NOTIONAL_PCT (10%) — scales with account, no static ceiling.
-    Floor: skip rather than inflate — preserves the 1% guarantee.
+    Cap  : equity×MAX_NOTIONAL_PCT (currently 30%) — scales with account, no static ceiling.
+    Floor: max(equity×MIN_NOTIONAL_PCT, MIN_NOTIONAL_USD) — skip rather than inflate
+           (preserves the RISK_PER_TRADE_PCT risk budget instead of over-sizing).
     """
     atr   = all_data[symbol].get('atr')
     price = all_data[symbol].get('tn_price') or all_data[symbol].get('price', 0)
@@ -416,7 +441,17 @@ def _finalize_open(symbol, direction, is_buy, notional_usd, atr_val,
                 struct_stop = sw_low - STRUCT_STOP_BUFFER * struct_atr
             elif not is_buy and sw_high and sw_high > fill_px:
                 struct_stop = sw_high + STRUCT_STOP_BUFFER * struct_atr
-    init_peak(symbol, fill_px, struct_stop=struct_stop, atr_val=atr_val)
+    init_peak(symbol, fill_px, struct_stop=struct_stop, atr_val=atr_val,
+              sz_decimals=(sym_data or {}).get('sz_decimals'))
+    # Place the exchange-side stop immediately so the position is protected from the
+    # moment it opens, not just from the next cycle's check_stops (Theme 4).
+    if atr_val:
+        peaks = _load_peaks()
+        pd = peaks.get(symbol)
+        if pd is not None:
+            init_stop = _initial_stop_price(direction, fill_px, atr_val, struct_stop)
+            if sync_exchange_stop(symbol, direction, fill_sz, init_stop, pd):
+                _save_peaks(peaks)
     action_label = "BUY" if is_buy else "SELL"
     log_trade(action_label, symbol, fill_sz, fill_px, reason, equity, confluence)
     emoji = "🟢" if is_buy else "🟠"
@@ -452,7 +487,8 @@ def close_position_market(symbol, all_data, equity, reason, confluence=""):
         fill_px = exec_price
         for s in statuses:
             if 'filled' in s:
-                fill_px = float(s['filled'].get('avgPx', exec_price))
+                avg_px = s['filled'].get('avgPx')
+                fill_px = float(avg_px) if avg_px is not None else exec_price
         # Confirm the close: an explicit fill, OR a FRESH position read that no longer
         # shows the symbol. A failed read (None) must NOT be treated as "gone" — that
         # would log a phantom close and abandon a position that is still open.
@@ -480,29 +516,39 @@ def close_position_market(symbol, all_data, equity, reason, confluence=""):
 
 def _load_peaks():
     raw = load_json(TRAILING_STOP_LOG, {})
-    # Migrate old flat format {sym: float} → {sym: {"peak": float, ...}}
-    migrated = False
+    # Migrate old flat format {sym: float} → {sym: {"peak": float, ...}} and DROP any
+    # malformed entry (non-dict, or dict without a numeric 'peak'). A malformed entry
+    # would otherwise raise inside check_stops and, caught only at the cycle level,
+    # abort stop checks for ALL positions for a full bar.
+    cleaned = {}
+    changed = False
     for sym, val in raw.items():
         if isinstance(val, (int, float)):
-            raw[sym] = {"peak": float(val), "struct_stop": None, "atr": None}
-            migrated = True
-        elif isinstance(val, dict) and 'atr' not in val:
-            raw[sym].pop('opened_at', None)
-            raw[sym]['atr'] = None
-            migrated = True
-    if migrated:
-        save_json(TRAILING_STOP_LOG, raw)
-    return raw
+            cleaned[sym] = {"peak": float(val), "struct_stop": None, "atr": None}
+            changed = True
+        elif isinstance(val, dict) and isinstance(val.get('peak'), (int, float)):
+            if 'atr' not in val:
+                val.pop('opened_at', None)
+                val['atr'] = None
+                changed = True
+            cleaned[sym] = val
+        else:
+            logger.error(f"Dropping malformed trailing-peak entry for {sym}: {val!r}")
+            changed = True
+    if changed:
+        save_json(TRAILING_STOP_LOG, cleaned)
+    return cleaned
 
 def _save_peaks(peaks):
     save_json(TRAILING_STOP_LOG, peaks)
 
-def init_peak(symbol, entry_price, struct_stop=None, atr_val=None):
+def init_peak(symbol, entry_price, struct_stop=None, atr_val=None, sz_decimals=None):
     peaks = _load_peaks()
     peaks[symbol] = {
         "peak": entry_price,
         "struct_stop": struct_stop,
         "atr": atr_val,
+        "sz_decimals": sz_decimals,   # for valid exchange-stop price rounding
     }
     _save_peaks(peaks)
     extra = f" | struct stop ${struct_stop:.4f}" if struct_stop is not None else ""
@@ -511,8 +557,74 @@ def init_peak(symbol, entry_price, struct_stop=None, atr_val=None):
 def clear_peak(symbol):
     peaks = _load_peaks()
     if symbol in peaks:
+        cancel_exchange_stop(symbol, peaks[symbol])
         del peaks[symbol]
         _save_peaks(peaks)
+
+
+# ─── Exchange-side stop orders (Theme 4) ──────────────────────────────────────
+# A reduce-only stop-market trigger order mirrors the chandelier level on the
+# exchange so the stop is enforced continuously, not just at each 4h cycle. The
+# in-process chandelier in check_stops remains as a backstop, so a failed/rejected
+# exchange stop never leaves a position fully unprotected.
+
+STOP_REPLACE_TOL = 0.001   # 0.1% — don't re-place the exchange stop for trivial moves
+
+def _initial_stop_price(side, entry, atr, struct_stop):
+    """The chandelier stop at entry (peak == entry), floored by the structural stop."""
+    dist = STOP_ATR_MULT * atr
+    if side == "LONG":
+        stop = entry - dist
+        if struct_stop is not None and struct_stop < entry:
+            stop = max(stop, struct_stop)
+    else:
+        stop = entry + dist
+        if struct_stop is not None and struct_stop > entry:
+            stop = min(stop, struct_stop)
+    return stop
+
+def sync_exchange_stop(symbol, side, size, stop_price, peak_data):
+    """Ensure a resting reduce-only stop-market order sits at ~stop_price.
+
+    Returns True if peak_data was modified (caller must save peaks). Never raises —
+    on any failure the soft chandelier in check_stops remains the backstop.
+    """
+    if not size or not stop_price or stop_price <= 0:
+        return False
+    cur_oid = peak_data.get('stop_oid')
+    cur_px  = peak_data.get('stop_px')
+    # Skip churn if an order already rests near the target level
+    if cur_oid is not None and cur_px and abs(stop_price - cur_px) <= STOP_REPLACE_TOL * cur_px:
+        return False
+    close_is_buy = (side == "SHORT")   # close a long → sell; close a short → buy
+    if cur_oid is not None:
+        # Confirm the old stop is cancelled BEFORE placing a new one — otherwise a
+        # silently-failed cancel leaves two resting reduce-only stops (an orphan that
+        # only restart-reconcile cleans, and which could touch a future same-side
+        # position). If we can't confirm, keep the existing stop and retry next cycle.
+        if not cancel_order(symbol, cur_oid):
+            logger.warning(f"Exchange stop {symbol}: cancel of old stop (oid {cur_oid}) not acknowledged — keeping it, retrying replace next cycle")
+            return False
+    szd = peak_data.get('sz_decimals')
+    px_decimals = (6 - szd) if szd is not None else None   # Hyperliquid perp price-decimal rule
+    oid, err = place_stop_market(symbol, close_is_buy, size, stop_price, px_decimals=px_decimals)
+    if oid is not None:
+        peak_data['stop_oid'] = oid
+        peak_data['stop_px']  = stop_price
+        logger.info(f"Exchange stop {symbol} {side}: reduce-only stop-market @ ~${stop_price:.4f} (oid {oid})")
+        return True
+    logger.warning(f"Exchange stop {symbol}: placement failed ({err}) — relying on soft stop, will retry next cycle")
+    if cur_oid is not None or cur_px is not None:
+        peak_data['stop_oid'] = None
+        peak_data['stop_px']  = None
+        return True
+    return False
+
+def cancel_exchange_stop(symbol, peak_data):
+    """Best-effort cancel of the resting stop order tracked in peak_data."""
+    oid = peak_data.get('stop_oid') if peak_data else None
+    if oid is not None:
+        cancel_order(symbol, oid)
 
 
 # ─── Pending LOC Orders ───────────────────────────────────────────────────────
@@ -569,14 +681,24 @@ def reconcile_open_orders():
             changed = True
             logger.warning(f"Reconcile: adopted resting order for {sym} (oid {meta['oid']})")
 
-    # 2. Cancel any live resting order not tracked in pending_loc
-    tracked_oids = {m.get('oid') for m in pending.values() if m.get('oid') is not None}
+    # 2. Cancel any live resting order not tracked in pending_loc OR as an exchange
+    #    stop in trailing_peaks (reduce-only stop orders are tracked there, not here).
+    #    EXCEPTION: never cancel an untracked order for a symbol that has an OPEN
+    #    position — it is most likely a protective stop whose tracking was lost (e.g.
+    #    peaks reset). Leave it; check_stops will re-sync. Only cancel for flat symbols.
+    open_syms = set((get_open_positions() or {}).keys())
+    stop_oids = {pd.get('stop_oid') for pd in _load_peaks().values() if pd.get('stop_oid') is not None}
+    tracked_oids = {m.get('oid') for m in pending.values() if m.get('oid') is not None} | stop_oids
     for sym, olist in by_symbol.items():
         for o in olist:
-            if o.get('oid') not in tracked_oids:
-                logger.warning(f"Reconcile: cancelling untracked resting order on {sym} (oid {o.get('oid')})")
-                send_telegram(f"♻️ <b>Reconcile</b>: cancelling untracked resting order on {sym} (oid {o.get('oid')})")
-                cancel_order(sym, o.get('oid'))
+            if o.get('oid') in tracked_oids:
+                continue
+            if sym in open_syms:
+                logger.warning(f"Reconcile: keeping untracked resting order on {sym} (oid {o.get('oid')}) — symbol has an open position (likely a protective stop)")
+                continue
+            logger.warning(f"Reconcile: cancelling untracked resting order on {sym} (oid {o.get('oid')})")
+            send_telegram(f"♻️ <b>Reconcile</b>: cancelling untracked resting order on {sym} (oid {o.get('oid')})")
+            cancel_order(sym, o.get('oid'))
 
     # 3. Drop placing-intents that never produced a resting order
     for sym in list(pending.keys()):
@@ -680,7 +802,10 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     data        = all_data[symbol]
     ema_val     = data.get('ema_entry')
     price       = data.get('tn_price') or data.get('price', 0)
-    sz_decimals = data.get('sz_decimals', 3)
+    sz_decimals = data.get('sz_decimals')
+    if sz_decimals is None:
+        logger.warning(f"{symbol}: szDecimals unknown — cannot size order safely, skipping entry")
+        return False
     direction   = "LONG" if is_long else "SHORT"
     adx_val     = data.get('adx', {}).get('adx', 0)
     st_dir      = data.get('supertrend', {}).get('direction', 'neutral')
@@ -821,7 +946,7 @@ def place_loc_order(symbol, is_long, all_data, equity, pb_reason=""):
     return False
 
 
-def check_stops(positions, all_data, equity):
+def check_stops(positions, all_data, equity, trust_positions=True):
     """
     Three exit triggers, evaluated in order per position:
 
@@ -839,215 +964,242 @@ def check_stops(positions, all_data, equity):
     closed_any = False
     mids = None   # lazy-loaded only if a degraded-mode price fallback is needed
 
+    # Reconcile: a tracked peak whose position is gone closed since last cycle —
+    # most likely the exchange-side stop fired between cycles (or a manual/external
+    # close). Cancel any lingering stop order and clear tracking. Only when positions
+    # are trustworthy (a stale/degraded snapshot could falsely flag an open position).
+    if trust_positions:
+        for sym in list(peaks.keys()):
+            if sym not in positions:
+                logger.info(f"{sym}: position gone since last cycle (exchange stop fired or external close) — clearing tracking")
+                send_telegram(f"ℹ️ <b>{sym} closed</b>\nExchange stop fired or external close — tracking cleared (PnL in metrics)")
+                cancel_exchange_stop(sym, peaks.pop(sym, None))
+                peaks_changed = True
+
     for sym, p in list(positions.items()):
-        data = all_data.get(sym)
-        if not data:
-            logger.warning(f"Stop check: {sym} missing from market data — attempting individual fetch")
-            try:
-                fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
-            except Exception:
-                fallback_ctxs = None
-            data = get_symbol_data(sym, asset_ctxs=fallback_ctxs)
-            if data:
-                all_data[sym] = data
-        entry = p['entry']
-        side  = p['side']
-        atr   = data.get('atr') if data else None
-        price = (data.get('tn_price') or data.get('price')) if data else None
-
-        # Degraded mode: market data and/or ATR unavailable. NEVER leave a held position
-        # unmanaged — fall back to the last mid price + the stored entry ATR so the
-        # chandelier can still fire. ST/funding/ADX exits are skipped (no data), but the
-        # chandelier is the actual stop-loss and only needs current price + stored ATR.
-        degraded = False
-        used_mid = False
-        if not atr or not price or not entry:
-            stored = peaks.get(sym, {})
-            if not price:
-                if mids is None:
-                    try:
-                        mids = get_all_mids() or {}
-                    except Exception:
-                        mids = {}
+        try:
+            data = all_data.get(sym)
+            if not data:
+                logger.warning(f"Stop check: {sym} missing from market data — attempting individual fetch")
                 try:
-                    price = float(mids.get(sym)) if mids.get(sym) else None
-                    used_mid = price is not None
-                except (TypeError, ValueError):
-                    price = None
-            if not atr:
-                atr = stored.get('atr')
-            if not price or not atr or not entry:
-                logger.error(f"Stop check: {sym} has no usable price/ATR even degraded — stop NOT evaluated this cycle")
-                send_telegram(f"⚠️ <b>CRITICAL: {sym} unmanaged</b>\nNo price/ATR available — stop NOT evaluated this cycle")
-                continue
-            degraded = True
-            px_src = "mid" if used_mid else "data"
-            logger.warning(f"Stop check {sym} {side}: DEGRADED — chandelier only (price from {px_src} ${price:.4f}, stored ATR {atr})")
-            send_telegram(f"⚠️ <b>{sym}: market data degraded</b>\nChandelier only — price from {px_src}, stored ATR (ST/funding/ADX exits skipped)")
+                    fallback_ctxs = mainnet_info.meta_and_asset_ctxs()
+                except Exception:
+                    fallback_ctxs = None
+                data = get_symbol_data(sym, asset_ctxs=fallback_ctxs)
+                if data:
+                    all_data[sym] = data
+            entry = p['entry']
+            side  = p['side']
+            atr   = data.get('atr') if data else None
+            price = (data.get('tn_price') or data.get('price')) if data else None
 
-        # Ensure peak entry exists before exit checks (ADX counter needs it)
-        if sym not in peaks:
-            peaks[sym] = {"peak": entry, "struct_stop": None, "atr": None}
-            peaks_changed = True
-        peak_data = peaks[sym]
+            # Degraded mode: market data and/or ATR unavailable. NEVER leave a held position
+            # unmanaged — fall back to the last mid price + the stored entry ATR so the
+            # chandelier can still fire. ST/funding/ADX exits are skipped (no data), but the
+            # chandelier is the actual stop-loss and only needs current price + stored ATR.
+            degraded = False
+            used_mid = False
+            if not atr or not price or not entry:
+                stored = peaks.get(sym, {})
+                if not price:
+                    if mids is None:
+                        try:
+                            mids = get_all_mids() or {}
+                        except Exception:
+                            mids = {}
+                    try:
+                        price = float(mids.get(sym)) if mids.get(sym) else None
+                        used_mid = price is not None
+                    except (TypeError, ValueError):
+                        price = None
+                if not atr:
+                    atr = stored.get('atr')
+                if not price or not atr or not entry:
+                    logger.error(f"Stop check: {sym} has no usable price/ATR even degraded — stop NOT evaluated this cycle")
+                    send_telegram(f"⚠️ <b>CRITICAL: {sym} unmanaged</b>\nNo price/ATR available — stop NOT evaluated this cycle")
+                    continue
+                degraded = True
+                px_src = "mid" if used_mid else "data"
+                logger.warning(f"Stop check {sym} {side}: DEGRADED — chandelier only (price from {px_src} ${price:.4f}, stored ATR {atr})")
+                send_telegram(f"⚠️ <b>{sym}: market data degraded</b>\nChandelier only — price from {px_src}, stored ATR (ST/funding/ADX exits skipped)")
 
-        # Supertrend direction (used by both the funding-exit reason and the ST exit).
-        # In degraded mode `data` is None → neutral defaults → ST/funding/ADX exits
-        # no-op and only the chandelier (below) runs.
-        st = (data or {}).get('supertrend', {})
-        st_dir = st.get('direction', 'neutral')
-        st_against = (side == "LONG" and st_dir == "bearish") or \
-                     (side == "SHORT" and st_dir == "bullish")
-
-        # ── 0. Funding exit — close if funding turns adverse while held ──────
-        # Order matches the backtest (funding before ST). When ST is ALSO against,
-        # note it in the reason so post-trade analysis isn't misled into attributing
-        # the exit purely to funding.
-        funding = (data or {}).get('funding_data', {}).get('funding', 0.0)
-        funding_against = (side == "LONG"  and funding >  FUNDING_EXIT_THRESHOLD) or \
-                          (side == "SHORT" and funding < -FUNDING_EXIT_THRESHOLD)
-        if funding_against:
-            also_st = " + ST against" if st_against else ""
-            logger.warning(
-                f"💸 FUNDING EXIT {sym} {side}: funding {funding:.4f}% adverse "
-                f"(threshold ±{FUNDING_EXIT_THRESHOLD}%){also_st} — closing"
-            )
-            send_telegram(
-                f"💸 <b>FUNDING EXIT {sym} {side}</b>\n"
-                f"Funding {funding:.4f}% turned adverse (±{FUNDING_EXIT_THRESHOLD}%){also_st} — market close"
-            )
-            if close_position_market(sym, all_data, equity,
-                                     f"Funding adverse ({funding:.4f}%){also_st}"):
-                peaks.pop(sym, None)
+            # Ensure peak entry exists before exit checks (ADX counter needs it)
+            if sym not in peaks:
+                peaks[sym] = {"peak": entry, "struct_stop": None, "atr": None}
                 peaks_changed = True
-                closed_any = True
-                time.sleep(1)
-            continue
+            peak_data = peaks[sym]
 
-        # ── 1. Supertrend exit — close whenever ST is against position ───────
-        if st_against:
-            logger.warning(
-                f"🔄 ST EXIT {sym} {side}: Supertrend is {st_dir.upper()} — closing"
-            )
-            send_telegram(
-                f"🔄 <b>SUPERTREND EXIT {sym} {side}</b>\n"
-                f"ST direction is {st_dir.upper()} — market close"
-            )
-            if close_position_market(sym, all_data, equity,
-                                     f"Supertrend {st_dir}"):
-                peaks.pop(sym, None)
-                peaks_changed = True
-                closed_any = True
-                time.sleep(1)
-            continue
+            # Supertrend direction (used by both the funding-exit reason and the ST exit).
+            # In degraded mode `data` is None → neutral defaults → ST/funding/ADX exits
+            # no-op and only the chandelier (below) runs.
+            st = (data or {}).get('supertrend', {})
+            st_dir = st.get('direction', 'neutral')
+            st_against = (side == "LONG" and st_dir == "bearish") or \
+                         (side == "SHORT" and st_dir == "bullish")
 
-        # ── 2. ADX decay exit — requires 2 consecutive bars below threshold ──
-        adx_val = (data or {}).get('adx', {}).get('adx', 0.0)
-        if adx_val == 0.0:
-            # Sentinel value — compute_adx returned its failure default.
-            # Treat as missing data: skip (don't count, don't close) and reset any
-            # in-progress decay counter so stale bad data can't accumulate toward exit.
-            if peak_data.get('adx_decay_count', 0):
-                peak_data['adx_decay_count'] = 0
-                peaks_changed = True
-            logger.warning(f"Stop check: ADX=0 for {sym} (sentinel) — skipping decay check")
-        elif adx_val < ADX_DECAY_EXIT:
-            decay_hits = peak_data.get('adx_decay_count', 0)
-            if decay_hits < 1:
-                # Bar 1: arm counter, fall through to chandelier — no exit yet.
-                peak_data['adx_decay_count'] = 1
-                peaks_changed = True
+            # ── 0. Funding exit — close if funding turns adverse while held ──────
+            # Order matches the backtest (funding before ST). When ST is ALSO against,
+            # note it in the reason so post-trade analysis isn't misled into attributing
+            # the exit purely to funding.
+            funding = (data or {}).get('funding_data', {}).get('funding', 0.0)
+            funding_against = (side == "LONG"  and funding >  FUNDING_EXIT_THRESHOLD) or \
+                              (side == "SHORT" and funding < -FUNDING_EXIT_THRESHOLD)
+            if funding_against:
+                also_st = " + ST against" if st_against else ""
                 logger.warning(
-                    f"📉 ADX DECLINING {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} "
-                    f"— confirming next bar before exit"
-                )
-            else:
-                # Bar 2: confirmed — close now.
-                logger.warning(
-                    f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
+                    f"💸 FUNDING EXIT {sym} {side}: funding {funding:.4f}% adverse "
+                    f"(threshold ±{FUNDING_EXIT_THRESHOLD}%){also_st} — closing"
                 )
                 send_telegram(
-                    f"📉 <b>ADX DECAY EXIT {sym} {side}</b>\n"
-                    f"ADX={adx_val:.1f} dropped below {ADX_DECAY_EXIT} — trend exhausted"
+                    f"💸 <b>FUNDING EXIT {sym} {side}</b>\n"
+                    f"Funding {funding:.4f}% turned adverse (±{FUNDING_EXIT_THRESHOLD}%){also_st} — market close"
                 )
                 if close_position_market(sym, all_data, equity,
-                                         f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
-                    peaks.pop(sym, None)
+                                         f"Funding adverse ({funding:.4f}%){also_st}"):
+                    cancel_exchange_stop(sym, peaks.pop(sym, None))
                     peaks_changed = True
                     closed_any = True
                     time.sleep(1)
-                    continue  # position closed — chandelier has nothing to act on
-                # close failed — fall through to chandelier as backstop
-        elif peak_data.get('adx_decay_count', 0):
-            peak_data['adx_decay_count'] = 0
-            peaks_changed = True
+                continue
 
-        peak          = peak_data["peak"]
-        struct_stop   = peak_data.get("struct_stop")
-        entry_atr     = peak_data.get("atr") or atr
-        stop_distance = STOP_ATR_MULT * atr
-        be_stop_dist  = STOP_ATR_MULT * entry_atr   # uses stored entry ATR so expansion can't break BE
+            # ── 1. Supertrend exit — close whenever ST is against position ───────
+            if st_against:
+                logger.warning(
+                    f"🔄 ST EXIT {sym} {side}: Supertrend is {st_dir.upper()} — closing"
+                )
+                send_telegram(
+                    f"🔄 <b>SUPERTREND EXIT {sym} {side}</b>\n"
+                    f"ST direction is {st_dir.upper()} — market close"
+                )
+                if close_position_market(sym, all_data, equity,
+                                         f"Supertrend {st_dir}"):
+                    cancel_exchange_stop(sym, peaks.pop(sym, None))
+                    peaks_changed = True
+                    closed_any = True
+                    time.sleep(1)
+                continue
 
-        # ── 4. Chandelier stop + structural floor ─────────────────────────────
-        if side == "LONG":
-            new_peak = max(peak, price)
-            if price - entry >= entry_atr:
-                # Floor peak at the BE anchor using entry ATR for the threshold so both
-                # the trigger and the activation check use the same distance. Note: stored
-                # peak may exceed the actual price high-water-mark while BE is active —
-                # it is a stop anchor, not a true MFE tracker.
-                new_peak = max(new_peak, entry + be_stop_dist)
-            chandelier_stop = new_peak - stop_distance
-            if struct_stop is not None and struct_stop < entry:
-                chandelier_stop = max(chandelier_stop, struct_stop)
-            be_active = new_peak >= entry + be_stop_dist
-            if be_active:
-                chandelier_stop = max(chandelier_stop, entry)
-            stop_price = chandelier_stop
-            breached   = price <= stop_price
-        else:
-            new_peak = min(peak, price)
-            if entry - price >= entry_atr:
-                new_peak = min(new_peak, entry - be_stop_dist)
-            chandelier_stop = new_peak + stop_distance
-            if struct_stop is not None and struct_stop > entry:
-                chandelier_stop = min(chandelier_stop, struct_stop)
-            be_active = new_peak <= entry - be_stop_dist
-            if be_active:
-                chandelier_stop = min(chandelier_stop, entry)
-            stop_price = chandelier_stop
-            breached   = price >= stop_price
-
-        if new_peak != peak:
-            peaks[sym]["peak"] = new_peak
-            peaks_changed = True
-
-        be_tag       = " [BE]" if be_active else ""
-        struct_tag   = f" | struct=${struct_stop:.4f}" if struct_stop else ""
-        degraded_tag = " [DEGRADED]" if degraded else ""
-        logger.debug(
-            f"Chandelier {sym} {side}: entry=${entry:.4f} peak=${new_peak:.4f} "
-            f"stop=${stop_price:.4f}{be_tag}{struct_tag}{degraded_tag} | now=${price:.4f}"
-        )
-
-        if breached:
-            stop_label = "break-even stop" if be_active else f"chandelier ({STOP_ATR_MULT}×ATR)"
-            logger.warning(
-                f"🛑 {stop_label.upper()} {sym} {side}: "
-                f"peak ${new_peak:.4f} → stop ${stop_price:.4f} | now ${price:.4f}"
-            )
-            send_telegram(
-                f"🛑 <b>{stop_label.upper()} {sym} {side}</b>\n"
-                f"Entry: ${entry:.4f} | Peak: ${new_peak:.4f}\n"
-                f"Stop: ${stop_price:.4f} | Now: ${price:.4f}"
-            )
-            if close_position_market(sym, all_data, equity,
-                                     f"{stop_label} at ${stop_price:.4f}"):
-                peaks.pop(sym, None)
+            # ── 2. ADX decay exit — requires 2 consecutive bars below threshold ──
+            adx_val = (data or {}).get('adx', {}).get('adx', 0.0)
+            if adx_val == 0.0:
+                # Sentinel value — compute_adx returned its failure default.
+                # Treat as missing data: skip (don't count, don't close) and reset any
+                # in-progress decay counter so stale bad data can't accumulate toward exit.
+                if peak_data.get('adx_decay_count', 0):
+                    peak_data['adx_decay_count'] = 0
+                    peaks_changed = True
+                logger.warning(f"Stop check: ADX=0 for {sym} (sentinel) — skipping decay check")
+            elif adx_val < ADX_DECAY_EXIT:
+                decay_hits = peak_data.get('adx_decay_count', 0)
+                if decay_hits < 1:
+                    # Bar 1: arm counter, fall through to chandelier — no exit yet.
+                    peak_data['adx_decay_count'] = 1
+                    peaks_changed = True
+                    logger.warning(
+                        f"📉 ADX DECLINING {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} "
+                        f"— confirming next bar before exit"
+                    )
+                else:
+                    # Bar 2: confirmed — close now.
+                    logger.warning(
+                        f"📉 ADX DECAY EXIT {sym} {side}: ADX={adx_val:.1f} < {ADX_DECAY_EXIT} — trend gone"
+                    )
+                    send_telegram(
+                        f"📉 <b>ADX DECAY EXIT {sym} {side}</b>\n"
+                        f"ADX={adx_val:.1f} dropped below {ADX_DECAY_EXIT} — trend exhausted"
+                    )
+                    if close_position_market(sym, all_data, equity,
+                                             f"ADX decay ({adx_val:.1f} < {ADX_DECAY_EXIT})"):
+                        cancel_exchange_stop(sym, peaks.pop(sym, None))
+                        peaks_changed = True
+                        closed_any = True
+                        time.sleep(1)
+                        continue  # position closed — chandelier has nothing to act on
+                    # close failed — fall through to chandelier as backstop
+            elif peak_data.get('adx_decay_count', 0):
+                peak_data['adx_decay_count'] = 0
                 peaks_changed = True
-                closed_any = True
-                time.sleep(1)
 
+            peak          = peak_data["peak"]
+            struct_stop   = peak_data.get("struct_stop")
+            entry_atr     = peak_data.get("atr") or atr
+            stop_distance = STOP_ATR_MULT * atr
+            be_stop_dist  = STOP_ATR_MULT * entry_atr   # uses stored entry ATR so expansion can't break BE
+
+            # ── 4. Chandelier stop + structural floor ─────────────────────────────
+            if side == "LONG":
+                new_peak = max(peak, price)
+                if price - entry >= entry_atr:
+                    # Floor peak at the BE anchor using entry ATR for the threshold so both
+                    # the trigger and the activation check use the same distance. Note: stored
+                    # peak may exceed the actual price high-water-mark while BE is active —
+                    # it is a stop anchor, not a true MFE tracker.
+                    new_peak = max(new_peak, entry + be_stop_dist)
+                chandelier_stop = new_peak - stop_distance
+                if struct_stop is not None and struct_stop < entry:
+                    chandelier_stop = max(chandelier_stop, struct_stop)
+                be_active = new_peak >= entry + be_stop_dist
+                if be_active:
+                    chandelier_stop = max(chandelier_stop, entry)
+                stop_price = chandelier_stop
+                breached   = price <= stop_price
+            else:
+                new_peak = min(peak, price)
+                if entry - price >= entry_atr:
+                    new_peak = min(new_peak, entry - be_stop_dist)
+                chandelier_stop = new_peak + stop_distance
+                if struct_stop is not None and struct_stop > entry:
+                    chandelier_stop = min(chandelier_stop, struct_stop)
+                be_active = new_peak <= entry - be_stop_dist
+                if be_active:
+                    chandelier_stop = min(chandelier_stop, entry)
+                stop_price = chandelier_stop
+                breached   = price >= stop_price
+
+            if new_peak != peak:
+                peaks[sym]["peak"] = new_peak
+                peaks_changed = True
+
+            be_tag       = " [BE]" if be_active else ""
+            struct_tag   = f" | struct=${struct_stop:.4f}" if struct_stop else ""
+            degraded_tag = " [DEGRADED]" if degraded else ""
+            logger.debug(
+                f"Chandelier {sym} {side}: entry=${entry:.4f} peak=${new_peak:.4f} "
+                f"stop=${stop_price:.4f}{be_tag}{struct_tag}{degraded_tag} | now=${price:.4f}"
+            )
+
+            if breached:
+                stop_label = "break-even stop" if be_active else f"chandelier ({STOP_ATR_MULT}×ATR)"
+                logger.warning(
+                    f"🛑 {stop_label.upper()} {sym} {side}: "
+                    f"peak ${new_peak:.4f} → stop ${stop_price:.4f} | now ${price:.4f}"
+                )
+                send_telegram(
+                    f"🛑 <b>{stop_label.upper()} {sym} {side}</b>\n"
+                    f"Entry: ${entry:.4f} | Peak: ${new_peak:.4f}\n"
+                    f"Stop: ${stop_price:.4f} | Now: ${price:.4f}"
+                )
+                if close_position_market(sym, all_data, equity,
+                                         f"{stop_label} at ${stop_price:.4f}"):
+                    cancel_exchange_stop(sym, peaks.pop(sym, None))
+                    peaks_changed = True
+                    closed_any = True
+                    time.sleep(1)
+            else:
+                # Maintain the exchange-side stop. Trail to the new level only with
+                # fresh, trusted data (don't move the stop based on a stale mid or a
+                # stale position snapshot). BUT if no stop is currently resting, place
+                # one even in degraded/stale mode — reduce-only makes a slightly-stale
+                # trigger safe, and it's far better than leaving the position soft-only.
+                has_stop = peak_data.get('stop_oid') is not None
+                if (trust_positions and not degraded) or not has_stop:
+                    if sync_exchange_stop(sym, side, abs(p['size']), stop_price, peak_data):
+                        peaks_changed = True
+
+        except Exception as e:
+            logger.error(f"Stop check error for {sym}: {e} — continuing with other positions")
+            send_telegram(f"⚠️ <b>Stop check error {sym}</b>\n{str(e)[:200]} — other positions still checked")
+            continue
     if peaks_changed:
         _save_peaks(peaks)
     return closed_any
@@ -1379,6 +1531,7 @@ def run_bot():
     while True:
         try:
             logger.info("--- New cycle ---")
+            cycle_start = time.time()
 
             # Fail closed: a failed position read returns None (not stale/empty data).
             # If we have a last-known snapshot, run stops on it in DEGRADED mode but
@@ -1420,7 +1573,7 @@ def run_bot():
 
             # ── Step 1: Automatic stops ────────────────────────────────────────
             if positions:
-                stopped = check_stops(positions, all_data, eq_display)
+                stopped = check_stops(positions, all_data, eq_display, trust_positions=not positions_stale)
                 if stopped:
                     time.sleep(SETTLE_SECONDS)
                     refreshed = get_open_positions()
@@ -1479,6 +1632,15 @@ def run_bot():
                 eq_display = final_eq
             print_summary(eq_display, positions, all_data)
 
+            # If the cycle overran a full interval (e.g. a long 429 backoff storm),
+            # a bar boundary was missed — run a catch-up cycle immediately instead of
+            # sleeping a full extra period (which would leave stops unevaluated for 8h).
+            elapsed = time.time() - cycle_start
+            if elapsed > INTERVAL_MINUTES * 60:
+                logger.error(f"Cycle overran the interval ({elapsed/60:.1f}min > {INTERVAL_MINUTES}min) — bar missed, running catch-up now")
+                send_telegram(f"⚠️ <b>Cycle overrun</b>\nCycle took {elapsed/60:.1f}min (> {INTERVAL_MINUTES}min interval) — running catch-up cycle after brief backoff")
+                time.sleep(60)   # floor backoff so a persistent overrun (API storm) can't busy-loop
+                continue
             sleep_until_next_hour()
 
         except Exception as e:

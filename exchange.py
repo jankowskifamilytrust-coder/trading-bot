@@ -73,7 +73,14 @@ def place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=False):
                 return 'resting', s['resting'].get('oid'), None, None, ''
             if 'filled' in s:
                 f = s['filled']
-                return 'filled', f.get('oid'), float(f.get('avgPx', limit_px)), float(f.get('totalSz', size_tokens)), ''
+                # avgPx/totalSz may be present-but-null; .get's default only applies to
+                # a missing key, so float(None) would raise and mislabel a real fill as
+                # an error. Fall back explicitly when the value is None.
+                avg_px = f.get('avgPx')
+                tot_sz = f.get('totalSz')
+                fill_px = float(avg_px) if avg_px is not None else limit_px
+                fill_sz = float(tot_sz) if tot_sz is not None else size_tokens
+                return 'filled', f.get('oid'), fill_px, fill_sz, ''
             if 'error' in s:
                 err_msg = s['error']
                 if 'immediately' in err_msg.lower() or 'post only' in err_msg.lower():
@@ -82,6 +89,49 @@ def place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=False):
         return 'error', None, None, None, f"unexpected response: {result}"
     except Exception as e:
         return 'error', None, None, None, str(e)
+
+
+_STOP_LIMIT_SLIP = 0.10  # market-trigger limit buffer past the trigger to guarantee fill
+
+def _round_px(px, px_decimals):
+    """Apply Hyperliquid's ≤5-significant-figure rule and, when known, the perp
+    decimal-place rule (≤ 6 - szDecimals) so the price isn't rejected as invalid."""
+    p = float(f"{px:.5g}")
+    if px_decimals is not None:
+        p = round(p, max(0, px_decimals))
+    return p
+
+
+def place_stop_market(symbol, is_buy, size_tokens, trigger_px, px_decimals=None, reduce_only=True):
+    """Reduce-only stop-MARKET trigger order. `is_buy` is the side of the CLOSING order
+    (buy to close a short, sell to close a long). Returns (oid_or_None, err).
+
+    The order rests on the exchange and triggers a market close when price crosses
+    trigger_px, so the stop is enforced continuously rather than only at each cycle.
+    Never raises — the caller keeps the soft chandelier as a backstop.
+    """
+    try:
+        tpx = _round_px(trigger_px, px_decimals)
+        if tpx <= 0:
+            return None, f"non-positive trigger px {trigger_px}"
+        # Limit after trigger: set past the trigger in the fill direction so the
+        # (market) stop always fills. Buy closes a short → limit above; sell → below.
+        raw_limit = tpx * (1 + _STOP_LIMIT_SLIP) if is_buy else tpx * (1 - _STOP_LIMIT_SLIP)
+        limit_px = _round_px(raw_limit, px_decimals)
+        order_type = {"trigger": {"triggerPx": tpx, "isMarket": True, "tpsl": "sl"}}
+        result = exchange.order(symbol, is_buy, size_tokens, limit_px, order_type,
+                                reduce_only=reduce_only)
+        statuses = result.get('response', {}).get('data', {}).get('statuses', [])
+        for s in statuses:
+            if 'resting' in s:
+                return s['resting'].get('oid'), ''
+            if 'error' in s:
+                return None, s['error']
+            if 'filled' in s:   # shouldn't fill immediately, but treat as placed
+                return s['filled'].get('oid'), ''
+        return None, f"unexpected response: {result}"
+    except Exception as e:
+        return None, str(e)
 
 
 def cancel_order(symbol, oid):

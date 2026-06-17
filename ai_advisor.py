@@ -16,6 +16,7 @@ from config import ADVISOR_LOG
 
 _client = None
 _MODEL = "claude-haiku-4-5"
+_LOG_CAP = 5000   # keep the advisor log bounded (it has no other rotation)
 
 
 def _get_client():
@@ -28,14 +29,18 @@ def _get_client():
 def _build_prompt(symbol, is_long, pb_reason, data):
     direction = "LONG" if is_long else "SHORT"
     adx_data  = data.get('adx', {})
+    # Coerce possibly-None values so float formatting can't raise (key present-but-None).
+    adx_v  = adx_data.get('adx') or 0
+    plus_v = adx_data.get('plus_di') or 0
+    minus_v = adx_data.get('minus_di') or 0
+    fund_v = data.get('funding_data', {}).get('funding') or 0
     return (
         f"A systematic trend-following strategy wants to open a {direction} "
         f"position on {symbol}.\n\n"
         "Signal context:\n"
         f"- Daily Supertrend direction: {data.get('supertrend', {}).get('direction', 'unknown')}\n"
-        f"- Daily ADX: {adx_data.get('adx', 0):.1f} (+DI={adx_data.get('plus_di', 0):.1f} "
-        f"-DI={adx_data.get('minus_di', 0):.1f})\n"
-        f"- Funding rate: {data.get('funding_data', {}).get('funding', 0):.4f}%\n"
+        f"- Daily ADX: {adx_v:.1f} (+DI={plus_v:.1f} -DI={minus_v:.1f})\n"
+        f"- Funding rate: {fund_v:.4f}%\n"
         f"- Current price: {data.get('tn_price') or data.get('price', 0)}\n"
         f"- 4h EMA: {data.get('ema_entry')}\n"
         f"- Daily EMA slope: {data.get('daily_slope', 'unknown')}\n"
@@ -81,8 +86,19 @@ def log_advisor_verdict(symbol, is_long, pb_reason, data):
         log_dir = os.path.dirname(ADVISOR_LOG)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-        with open(ADVISOR_LOG, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        # Read-trim-rewrite (atomic) so the log stays bounded and a crash mid-write
+        # can't leave a partial trailing line.
+        lines = []
+        if os.path.exists(ADVISOR_LOG):
+            with open(ADVISOR_LOG) as f:
+                lines = f.readlines()
+        lines.append(json.dumps(entry) + "\n")
+        if len(lines) > _LOG_CAP:
+            lines = lines[-_LOG_CAP:]
+        tmp = ADVISOR_LOG + ".tmp"
+        with open(tmp, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp, ADVISOR_LOG)
     except Exception as e:
         logger.warning(f"Advisor log write failed: {e}")
 
