@@ -49,9 +49,9 @@ START_EQUITY_LOG      = "data/start_equity.json"
 ADVISOR_LOG           = "data/advisor_log.jsonl"
 VOLUME_RANK_TTL_HOURS = 24
 
-FUNDING_LONG_MAX     = 0.018   # % — skip long if funding above this (aligned to exit threshold)
-FUNDING_SHORT_MIN    = -0.018  # % — skip short if funding below this (aligned to exit threshold)
-FUNDING_EXIT_THRESHOLD = 0.018 # % — close a held position if funding turns this adverse
+FUNDING_LONG_MAX     = 0.015   # % — skip long if funding above this (aligned to exit threshold)
+FUNDING_SHORT_MIN    = -0.015  # % — skip short if funding below this (aligned to exit threshold)
+FUNDING_EXIT_THRESHOLD = 0.015 # % — close a held position if funding turns this adverse
                                #     (long: funding > +threshold; short: funding < −threshold)
 ADX_DECAY_EXIT       = 20      # close if ADX drops below this while holding
 VOLUME_CONFIRM_RATIO = 0.7     # hook bar must have ≥70% of 10-bar avg volume
