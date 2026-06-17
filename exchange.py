@@ -10,10 +10,11 @@ from loguru import logger
 
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
+master = os.getenv("MASTER_ADDRESS", wallet.address)
 
 # MAINNET, standard perp dex only.
 mainnet_info = Info(constants.MAINNET_API_URL, skip_ws=True)
-exchange = Exchange(wallet, constants.MAINNET_API_URL)
+exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address=master)
 
 
 def get_all_mids():
@@ -91,7 +92,7 @@ def get_open_positions():
     global _last_positions
     positions = {}
     try:
-        state = mainnet_info.user_state(wallet.address)
+        state = mainnet_info.user_state(master)
         for p in state.get('assetPositions', []):
             pos = p.get('position', {})
             coin = pos.get('coin')
@@ -110,12 +111,13 @@ def get_open_positions():
 
 
 def get_equity():
-    """Account value for the standard perp dex."""
+    """Account value — spot USDC balance (unified account mode)."""
     try:
-        user_state = mainnet_info.user_state(wallet.address)
-        return float(user_state['marginSummary']['accountValue'])
+        spot = mainnet_info.spot_user_state(master)
+        for b in spot.get('balances', []):
+            if b.get('coin') == 'USDC':
+                return float(b.get('total', 0))
+        return 0.0
     except Exception as e:
         logger.error(f"Equity read error: {e}")
         return 0.0
-
-
