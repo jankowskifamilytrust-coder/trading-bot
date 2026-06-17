@@ -12,7 +12,7 @@ sys.path.insert(0, '/Users/marekjankowski/trading-bot')
 from exchange import mainnet_info
 from signals import (
     compute_supertrend, compute_adx, compute_atr,
-    compute_rsi, compute_ema, compute_volume_ratio,
+    compute_rsi, compute_ema, compute_ema_slope, compute_volume_ratio,
 )
 from config import (
     STABLECOINS, TOP_N,
@@ -220,18 +220,21 @@ def get_signals(sym, bar_t, daily, h4):
 
     price = float(h4_bars[-1]['c'])
 
-    # Daily — strategic signals
-    d_win    = d_bars[-60:]
+    # Daily — strategic signals.
+    # Window matches the live bot's 90-day daily lookback (bot.py get_symbol_data):
+    # Supertrend/ADX/ATR are recursively seeded, so the window length must match or
+    # the backtest produces different flips/values than live would have on the same day.
+    d_win    = d_bars[-90:]
     st       = compute_supertrend(d_win, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_MULT)
     adx_data = compute_adx(d_win)
     atr      = compute_atr(d_win)
-    # C0: daily EMA slope (replaces the 4h slope used in the live bot)
-    d_ema_now  = compute_ema(d_win,      period=EMA_PERIOD)
-    d_ema_prev = compute_ema(d_win[:-3], period=EMA_PERIOD) if len(d_win) > EMA_PERIOD + 3 else None
-    daily_slope = ("up" if d_ema_now > d_ema_prev else "down") if (d_ema_now and d_ema_prev) else "unknown"
+    # C0: daily EMA slope — single seeded series, matches the live bot
+    daily_slope = compute_ema_slope(d_win, period=EMA_PERIOD, lag=3)
 
-    # 4h — entry conditions (C2–C5)
-    h4_win    = h4_bars[-40:]
+    # 4h — entry conditions (C2–C5).
+    # Window matches the live bot's 30-day 4h lookback (~180 bars) so EMA/RSI/volume
+    # are seeded identically to live.
+    h4_win    = h4_bars[-180:]
     rsi       = compute_rsi(h4_win, period=14, lookback=RSI_LOOKBACK)
     ema       = compute_ema(h4_win, period=EMA_PERIOD)
     vol_ratio = compute_volume_ratio(h4_win, lookback=10)

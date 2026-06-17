@@ -7,14 +7,16 @@ from hyperliquid.utils import constants
 
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
+master = os.getenv("MASTER_ADDRESS", wallet.address)
 info = Info(constants.MAINNET_API_URL, skip_ws=True)
 
 print("=" * 50)
-print("Wallet address:", wallet.address)
+print("API wallet:    ", wallet.address)
+print("Master account:", master)
 print("MAINNET")
 print("=" * 50)
 
-state = info.user_state(wallet.address)
+state = info.user_state(master)
 
 print("\nAccount value:", state.get('marginSummary', {}).get('accountValue'))
 print("\nOpen positions:")
@@ -32,7 +34,7 @@ print(json.dumps(state, indent=2))
 
 print("\n" + "=" * 50)
 print("SPOT BALANCES:")
-spot = info.spot_user_state(wallet.address)
+spot = info.spot_user_state(master)
 for b in spot.get('balances', []):
     print(f"  {b.get('coin')}: total={b.get('total')} hold={b.get('hold')}")
 print("=" * 50)

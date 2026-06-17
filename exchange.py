@@ -35,17 +35,26 @@ def get_book(symbol):
         best_bid = px(bids[0])
         best_ask = px(asks[0])
 
-        if len(asks) >= 2:
-            tick = abs(px(asks[1]) - px(asks[0]))
-        elif len(bids) >= 2:
-            tick = abs(px(bids[0]) - px(bids[1]))
-        else:
-            tick = abs(best_ask - best_bid)
+        # Tick: Hyperliquid L2 levels are price-aggregated and skip empty prices,
+        # so the gap between the top two levels is often several ticks and would
+        # over-estimate the increment. Use the SMALLEST nonzero gap across the
+        # nearest levels as the best estimate of the true tick.
+        def min_gap(levels):
+            prices = sorted({px(l) for l in levels})
+            gaps = [b - a for a, b in zip(prices, prices[1:]) if b - a > 0]
+            return min(gaps) if gaps else 0.0
+
+        candidate_gaps = [g for g in (min_gap(asks[:10]), min_gap(bids[:10])) if g > 0]
+        tick = min(candidate_gaps) if candidate_gaps else abs(best_ask - best_bid)
         if tick <= 0:
             tick = abs(best_ask - best_bid)
 
-        s = str(asks[0]['px']) if isinstance(asks[0], dict) else str(asks[0][0])
-        decimals = len(s.split('.')[1]) if '.' in s else 0
+        # Decimals (for display): take the max decimal places across nearby levels
+        # rather than a single level whose trailing zeros may be trimmed.
+        def dec_of(level):
+            s = str(level['px']) if isinstance(level, dict) else str(level[0])
+            return len(s.split('.')[1]) if '.' in s else 0
+        decimals = max((dec_of(l) for l in (asks[:10] + bids[:10])), default=0)
 
         return best_bid, best_ask, tick, decimals
     except Exception as e:
@@ -76,13 +85,16 @@ def place_alo_limit(symbol, is_buy, size_tokens, limit_px, reduce_only=False):
 
 
 def cancel_order(symbol, oid):
+    """Cancel a resting order. Returns True if acknowledged, False otherwise."""
     if oid is None:
-        return
+        return False
     try:
         exchange.cancel(symbol, oid)
         logger.info(f"Cancelled resting order {oid} on {symbol}")
+        return True
     except Exception as e:
         logger.warning(f"Cancel {symbol} oid {oid} failed (may have already filled): {e}")
+        return False
 
 
 _last_positions: dict = {}

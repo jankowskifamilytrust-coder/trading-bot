@@ -7,13 +7,14 @@ from hyperliquid.utils import constants
 
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
-# MAINNET emergency flatten.
-exchange = Exchange(wallet, constants.MAINNET_API_URL)
+master = os.getenv("MASTER_ADDRESS", wallet.address)
+# MAINNET emergency flatten. Sign with the API wallet, act on the master account.
+exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address=master)
 info = Info(constants.MAINNET_API_URL, skip_ws=True)  # skip_ws prevents the hang
 
 print("Closing all positions (mainnet)...")
 closed = 0
-state = info.user_state(wallet.address)
+state = info.user_state(master)
 for p in state.get('assetPositions', []):
     pos = p.get('position', {})
     coin = pos.get('coin')

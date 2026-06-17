@@ -9,7 +9,7 @@ from hyperliquid.utils import constants
 load_dotenv()
 wallet = Account.from_key(os.getenv("PRIVATE_KEY"))
 info = Info(constants.MAINNET_API_URL, skip_ws=True)
-addr = wallet.address
+addr = os.getenv("MASTER_ADDRESS", wallet.address)  # fills/funding accrue on the master account
 
 def f(x, default=0.0):
     try:
@@ -61,7 +61,7 @@ for fl in fills:
 
     if direction.startswith("Open"):
         opens += 1
-    elif direction.startswith("Close") or direction in ("Sell", "Buy"):
+    elif direction.startswith("Close"):
         closes += 1
 
     c = per_coin.setdefault(coin, {"pnl": 0.0, "fees": 0.0, "fills": 0})

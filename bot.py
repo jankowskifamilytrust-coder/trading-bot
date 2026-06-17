@@ -35,7 +35,7 @@ except Exception as _e:
         return None
 from signals import (
     compute_daily_vol, compute_atr,
-    compute_funding, compute_supertrend, compute_adx, compute_rsi, compute_ema,
+    compute_funding, compute_supertrend, compute_adx, compute_rsi, compute_ema, compute_ema_slope,
     compute_volume_ratio, compute_struct_stops,
 )
 from exchange import (
@@ -224,11 +224,7 @@ def get_symbol_data(symbol, max_retries=3, retry_delay=5, asset_ctxs=None, mids=
                 supertrend = compute_supertrend(daily_candles)
                 adx = compute_adx(daily_candles)
                 # C0: daily EMA slope (one timeframe up from the 4h entry trigger)
-                d_ema_now  = compute_ema(daily_candles, period=EMA_PERIOD)
-                d_ema_prev = compute_ema(daily_candles[:-3], period=EMA_PERIOD) \
-                             if daily_candles and len(daily_candles) > EMA_PERIOD + 3 else None
-                daily_slope = ("up" if d_ema_now > d_ema_prev else "down") \
-                              if (d_ema_now and d_ema_prev) else "unknown"
+                daily_slope = compute_ema_slope(daily_candles, period=EMA_PERIOD, lag=3)
             except Exception as e:
                 logger.warning(f"{symbol}: daily candle fetch failed — Supertrend/ADX neutral: {e}")
                 supertrend = {"direction": "neutral", "value": 0.0, "changed": False}
@@ -530,8 +526,7 @@ def check_pending_loc(positions, all_data, equity):
         oid       = meta['oid']
         direction = "LONG" if meta['is_buy'] else "SHORT"
 
-        if symbol in positions and positions[symbol]['side'] == direction:
-            logger.info(f"{symbol} LOC {direction} filled while sleeping — finalizing")
+        def _finalize():
             sym_data = all_data.get(symbol)
             if sym_data is None:
                 logger.warning(f"{symbol}: not in all_data this cycle — fetching individually for LOC finalization")
@@ -547,17 +542,35 @@ def check_pending_loc(positions, all_data, equity):
                 equity,
                 sym_data=sym_data,
             )
-        else:
-            logger.info(f"{symbol} LOC {direction} unfilled at bar close — cancelling (oid {oid})")
-            try:
-                cancel_order(symbol, oid)
-                to_remove.append(symbol)
-            except Exception as e:
-                logger.warning(f"{symbol} LOC cancel failed: {e} — keeping in pending for next cycle")
-                continue
-            send_telegram(f"⌛ <b>{symbol} {direction} LOC expired</b>\nOrder at ${meta['limit_px']:.4f} cancelled (no fill)")
+            to_remove.append(symbol)
+
+        if symbol in positions and positions[symbol]['side'] == direction:
+            logger.info(f"{symbol} LOC {direction} filled while sleeping — finalizing")
+            _finalize()
             continue
-        to_remove.append(symbol)
+
+        # Not in the cycle-start snapshot. Re-check live state: the order may have
+        # filled after that snapshot was taken but before we got here.
+        live = get_open_positions()
+        if symbol in live and live[symbol]['side'] == direction:
+            logger.info(f"{symbol} LOC {direction} filled just before resolution — finalizing")
+            _finalize()
+            continue
+
+        logger.info(f"{symbol} LOC {direction} unfilled at bar close — cancelling (oid {oid})")
+        if cancel_order(symbol, oid):
+            send_telegram(f"⌛ <b>{symbol} {direction} LOC expired</b>\nOrder at ${meta['limit_px']:.4f} cancelled (no fill)")
+            to_remove.append(symbol)
+        else:
+            # Cancel not acknowledged — the order may still be resting. Don't drop
+            # the record blindly: re-check for a fill, finalize if open, else keep
+            # the pending record and retry the cancel next cycle.
+            live = get_open_positions()
+            if symbol in live and live[symbol]['side'] == direction:
+                logger.info(f"{symbol}: cancel failed but position is now open — finalizing")
+                _finalize()
+            else:
+                logger.warning(f"{symbol}: LOC cancel not acknowledged and no fill seen — keeping pending for next cycle")
 
     for symbol in to_remove:
         del pending[symbol]
@@ -1240,12 +1253,18 @@ def run_bot():
                 if entry_sym:
                     peaks = _load_peaks()
                     # Open-position risk: full STOP_ATR_MULT×ATR even for BE-locked trades.
+                    # If ATR is unknown for a position (missing peak record or no market
+                    # data this cycle), fall back to its budgeted RISK_PER_TRADE_PCT rather
+                    # than 0 — counting it as zero would silently defeat the heat cap and
+                    # let the bot over-leverage.
                     # Pending LOC risk: each resting order represents RISK_PER_TRADE_PCT.
                     # Prospective entry: +1 trade's worth so we can't step over the cap.
-                    open_risk = sum(
-                        abs(p['size']) * (peaks.get(sym, {}).get('atr') or all_data.get(sym, {}).get('atr') or 0) * STOP_ATR_MULT
-                        for sym, p in positions.items()
-                    )
+                    def _pos_risk(sym, p):
+                        atr = peaks.get(sym, {}).get('atr') or all_data.get(sym, {}).get('atr')
+                        if not atr:
+                            return RISK_PER_TRADE_PCT * equity
+                        return abs(p['size']) * atr * STOP_ATR_MULT
+                    open_risk = sum(_pos_risk(sym, p) for sym, p in positions.items())
                     open_risk += (len(pending_syms) + 1) * RISK_PER_TRADE_PCT * equity
                     heat_pct = open_risk / equity if equity > 0 else 0
                     logger.info(f"Portfolio heat: ${open_risk:.2f} = {heat_pct*100:.1f}% of equity")

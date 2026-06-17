@@ -204,19 +204,44 @@ def compute_rsi(candles, period=RSI_PERIOD, lookback=RSI_LOOKBACK):
         return {"rsi": 50.0, "prev_rsi": 50.0, "min_recent": 50.0, "max_recent": 50.0}
 
 
-def compute_ema(candles, period=EMA_PERIOD):
-    """Standard EMA of close prices seeded with SMA over the first `period` bars."""
+def compute_ema_series(candles, period=EMA_PERIOD):
+    """EMA of close prices as a full series (one value per bar from index period-1)."""
     try:
         closes = [float(c['c']) for c in candles]
         if len(closes) < period:
-            return None
+            return []
         k = 2.0 / (period + 1)
         ema = sum(closes[:period]) / period
+        series = [ema]
         for close in closes[period:]:
             ema = close * k + ema * (1.0 - k)
-        return round(ema, 6)
+            series.append(ema)
+        return series
     except Exception:
-        return None
+        return []
+
+
+def compute_ema(candles, period=EMA_PERIOD):
+    """Standard EMA of close prices seeded with SMA over the first `period` bars."""
+    series = compute_ema_series(candles, period=period)
+    return round(series[-1], 6) if series else None
+
+
+def compute_ema_slope(candles, period=EMA_PERIOD, lag=3):
+    """Direction of the EMA over the last `lag` bars: 'up' / 'down' / 'unknown'.
+
+    Reads a single seeded EMA series and compares series[-1] to series[-1-lag].
+    This is the true EMA `lag` bars ago — unlike comparing compute_ema(candles)
+    to compute_ema(candles[:-lag]), which re-seeds from a different first bar and
+    yields an only-approximate (and near flat EMA, sometimes wrong) slope.
+    """
+    series = compute_ema_series(candles, period=period)
+    if len(series) < lag + 1:
+        return "unknown"
+    now, prev = series[-1], series[-1 - lag]
+    if now == prev:
+        return "unknown"
+    return "up" if now > prev else "down"
 
 
 def compute_volume_ratio(candles, lookback=10):
